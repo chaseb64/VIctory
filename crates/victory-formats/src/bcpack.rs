@@ -309,7 +309,7 @@ struct Lane {
 impl Lane {
     /// One step: take the latched byte (header, length or payload) and
     /// decode at most one symbol.
-    fn step(&mut self, t: &Tables) -> Result<(), Error> {
+    fn step(&mut self, t: &Tables, complete: impl FnOnce() -> bool) -> Result<(), Error> {
         if self.phase != 3 {
             let Some(b) = self.latch.take() else {
                 return Ok(());
@@ -372,7 +372,8 @@ impl Lane {
             self.x = x;
         } else {
             self.phase = 0;
-            self.need = self.latch.is_none();
+            // After the last symbol, drain this payload without requesting another header.
+            self.need = self.latch.is_none() && !complete();
             self.x = if self.reset { 0 } else { x };
         }
         Ok(())
@@ -425,12 +426,7 @@ fn lanes(
             let bit = 1 << j;
             let before = taken;
             if !lane.stalled {
-                lane.step(t)?;
-            }
-            // A lane may still need the tail of its current payload after its
-            // last symbol. Once both are exhausted it cannot start a header.
-            if pos + 1 == symbols && done & bit != 0 && lane.left == 0 {
-                continue;
+                lane.step(t, || pos + 1 == symbols && done & bit != 0)?;
             }
             let waiting = lane.out.is_some() && done & bit != 0;
             if lane.need && !waiting && taken < ROUND_BYTES {
@@ -1524,7 +1520,7 @@ mod tests {
                             left: 1,
                             ..Default::default()
                         };
-                        lane.step(&t).unwrap();
+                        lane.step(&t, || false).unwrap();
                         let (sym, next) = reference_decode(&t, model, x);
                         assert_eq!(
                             (lane.out, lane.x),
