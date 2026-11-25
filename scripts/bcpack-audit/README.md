@@ -1,0 +1,9 @@
+# Native Windows BCPack verification
+
+This fork-only workflow checks the candidate and baseline on the standard Windows Server 2025 x64 runner. The workflow records the tested Git revisions, native Cargo results, per-case entropy output and full conformance-title TAP reports in the run artifact.
+
+The entropy replay generates records first, encodes them with Ahmet Dedeler’s public bcpack-rs encoder and checks the contiguous input through its independent decoder. It compares VIctory’s decoded lane records with the original symbols. The upstream release uses MIT OR Apache-2.0, and its rANS implementation credits Microsoft’s MIT-licensed silicon-rans. The workflow compiles those modules from the pinned checkout. VIctory reads its existing shipped tables under its repository asset policy. [bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs/tree/b1c3099a3402de8b76c9263a828791bd8bc0c930) · [Third-party notices](https://github.com/Ahmet-Dedeler/bcpack-rs/blob/b1c3099a3402de8b76c9263a828791bd8bc0c930/THIRD_PARTY_NOTICES.md) · [VIctory asset policy](https://github.com/Marvisak/VIctory/blob/940d32f69b22265690a0b5a15d6ded572ba33baf/docs/asset-policy.md)
+
+The queue check extends 0xkn0wh3r3’s conformance title on both revisions. It adds generated BC1 requests and checks status, output and guard bytes for memory, file and zlib paths. The original harness checks its five known divergences. The paired driver also checks the exact additional baseline failure and the corrected candidate output. [Upstream conformance proposal](https://github.com/Marvisak/VIctory/pull/2057)
+
+AI-assisted using OpenAI Codex. GPT-6.2 Astra (Ultra) handled integration. GPT-6.2 Astra (High) produced and reviewed entropy and fixture evidence. GPT-6.2 Sol (High) contributed the queued fixtures, format checks and measured performance refinement. GPT-6 Luna (Medium) contributed reference and Windows evidence handling.
