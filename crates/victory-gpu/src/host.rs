@@ -36,6 +36,9 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
+#[cfg(feature = "diagnostics")]
+type SubmissionDump = (u64, Vec<(usize, String)>);
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
@@ -657,6 +660,7 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    has_expanded_snapshot: bool,
     uploads: Vec<ID3D12Resource>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -802,6 +806,44 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        let mut dumps = Vec::new();
+        let mut batch = |lists: &[&HostList]| {
+            self.execute_batch(
+                lists,
+                &mut submitted,
+                #[cfg(feature = "diagnostics")]
+                &mut dumps,
+            )
+        };
+        // Replaying the same list would refill its mapped uploads before the
+        // first execution had consumed them. Fence before that list recurs.
+        let mut first = 0;
+        let mut snapshots = std::collections::HashSet::new();
+        if runs.len() > 1 {
+            for (i, list) in runs.iter().enumerate() {
+                if list.deferred().has_expanded_snapshot && !snapshots.insert(list.id) {
+                    batch(&runs[first..i]);
+                    snapshots.clear();
+                    snapshots.insert(list.id);
+                    first = i;
+                }
+            }
+        }
+        batch(&runs[first..]);
+        drop(submitted);
+        #[cfg(feature = "diagnostics")]
+        for (sub, targets) in dumps {
+            crate::capture::dump_submission(sub, &targets);
+        }
+    }
+
+    fn execute_batch(
+        &self,
+        runs: &[&HostList],
+        submitted: &mut u64,
+        #[cfg(feature = "diagnostics")] dumps: &mut Vec<SubmissionDump>,
+    ) {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -1011,13 +1053,24 @@ impl Host {
         }
         // The submission has run and the next waits for our lock.
         release_retired();
-        self.log_messages();
+        let debug_error = self.log_messages();
+        #[cfg(test)]
+        if crate::switch::on("VICTORY_REQUIRE_D3D12_DEBUG") {
+            assert!(
+                self.messages.is_some(),
+                "D3D12 debug layer required for validation"
+            );
+            assert!(
+                debug_error.is_none(),
+                "D3D12 validation error: {debug_error:?}"
+            );
+        }
+        let _ = debug_error;
         // A listed frame: what this submission's lists drew, as it is now
         // (the dumps submit lists of their own).
         #[cfg(feature = "diagnostics")]
         if traced {
             let sub = *submitted;
-            drop(submitted);
             let mut targets: Vec<(usize, String)> = Vec::new();
             for r in runs {
                 for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -1026,7 +1079,7 @@ impl Host {
                     }
                 }
             }
-            crate::capture::dump_submission(sub, &targets);
+            dumps.push((sub, targets));
         }
     }
 
@@ -1786,7 +1839,9 @@ impl HostList {
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+        let mut deferred = self.deferred();
+        deferred.has_expanded_snapshot |= staging.expanded;
+        deferred.copies.push(Step::Texture(staging));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`

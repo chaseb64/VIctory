@@ -30,7 +30,7 @@ use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 use crate::object::This;
-use crate::resource::HostTexture;
+use crate::resource::{HostTexture, TextureEncoding};
 
 /// Which side holds the newer contents.
 pub(crate) const BOTH: u8 = 0;
@@ -139,7 +139,12 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
         }
         let texture = texture?;
         crate::host::name(&texture, || format!("depth twin {}x{} f{f}", dd.Width, dd.Height));
-        planes.push(Arc::new(HostTexture::new(texture, 0, Vec::new())));
+        planes.push(Arc::new(HostTexture::new(
+            texture,
+            0,
+            Vec::new(),
+            TextureEncoding::Native,
+        )));
     }
     // The depth texture's footprints, every plane, and the twin's.
     let n = subs * planes.len() as u32;

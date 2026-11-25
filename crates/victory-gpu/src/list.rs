@@ -310,6 +310,13 @@ pub(crate) struct Barrier {
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
     let host = |r: This| crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast());
+    let is_packed = |r| crate::resource::title_format(r) == Some(crate::resource::R4G4_UNORM);
+    if (b.kind == 1 && (is_packed(b.first) || is_packed(b.second as This)))
+        || (b.kind == 2 && is_packed(b.first))
+    {
+        tracing::warn!("sampled R4G4 cannot participate in aliasing or unordered-access barriers");
+        return None;
+    }
     match b.kind {
         0 => {
             // A split barrier's first half: its second half transitions.
@@ -320,6 +327,10 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);
+            if is_packed(b.first) && wanted & !(0x40 | 0x80 | COPY_DEST | COPY_SOURCE) != 0 {
+                tracing::warn!(wanted, "unsupported sampled R4G4 state transition");
+                return None;
+            }
             let (texture, before) = list.transition(b.first, wanted)?;
             Some(Barrier {
                 kind: 0,
@@ -457,6 +468,15 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
+        if [dst, src]
+            .iter()
+            .any(|&r| crate::resource::title_format(r) == Some(crate::resource::R4G4_UNORM))
+        {
+            if crate::r4g4::whole(list, dst, src).is_none() {
+                tracing::warn!("incompatible sampled R4G4 CopyResource");
+            }
+            return;
+        }
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -491,9 +511,44 @@ extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct CopyLocation {
-    resource: This,
-    kind: u32,
-    footprint: crate::resource::PlacedFootprint,
+    pub(crate) resource: This,
+    pub(crate) kind: u32,
+    pub(crate) footprint: crate::resource::PlacedFootprint,
+}
+
+#[cfg(windows)]
+impl CopyLocation {
+    // A subresource-index union initializes only its first 32 bits.
+    unsafe fn read(ptr: *const Self) -> Option<Self> {
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: title supplies the location header and the active union member.
+        unsafe {
+            let kind = (&raw const (*ptr).kind).read();
+            let member = &raw const (*ptr).footprint;
+            let footprint = match kind {
+                0 => crate::resource::PlacedFootprint {
+                    offset: u64::from(member.cast::<u32>().read()),
+                    format: 0,
+                    width: 0,
+                    height: 0,
+                    depth: 0,
+                    row_pitch: 0,
+                },
+                1 => member.read(),
+                _ => {
+                    tracing::warn!(kind, "unknown texture copy location");
+                    return None;
+                }
+            };
+            Some(Self {
+                resource: (&raw const (*ptr).resource).read(),
+                kind,
+                footprint,
+            })
+        }
+    }
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
@@ -514,13 +569,23 @@ extern "system" fn copy_texture_region(
         use windows::core::Interface;
         const FOOTPRINT: u32 = 1;
         // SAFETY: the title passes both locations (null is tolerated).
-        let (Some(list), Some(&dst), Some(&src)) =
-            (host_list(this), unsafe { dst.as_ref() }, unsafe {
-                src.as_ref()
-            })
-        else {
+        let (Some(list), Some(dst), Some(src)) = (
+            host_list(this),
+            unsafe { CopyLocation::read(dst) },
+            unsafe { CopyLocation::read(src) },
+        ) else {
             return;
         };
+        if crate::r4g4::involved(&dst) || crate::r4g4::involved(&src) {
+            // SAFETY: the optional box contains six title-supplied coordinates.
+            let area = unsafe { source_box.as_ref() }.copied();
+            if crate::r4g4::region(list, &dst, [x, y, z], &src, area).is_none() {
+                tracing::warn!(
+                    "unsupported sampled R4G4 copy location, footprint, alias or rectangle"
+                );
+            }
+            return;
+        }
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
@@ -642,6 +707,14 @@ extern "system" fn resolve(
         };
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         use windows::core::Interface;
+        if format == crate::resource::R4G4_UNORM
+            || [src, dst]
+                .iter()
+                .any(|&r| crate::resource::title_format(r) == Some(crate::resource::R4G4_UNORM))
+        {
+            tracing::warn!("sampled R4G4 does not support resolve");
+            return;
+        }
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
         ensure_state(list, dst, RESOLVE_DEST);
@@ -786,7 +859,15 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
+        if crate::resource::overlaps_expanded(dst, len as u64) {
+            tracing::warn!("raw copy to sampled R4G4 memory is unsupported");
+            return;
+        }
         list.defer(move || {
+            if crate::resource::overlaps_expanded(dst, len as u64) {
+                tracing::warn!("raw copy destination now aliases a sampled R4G4 resource");
+                return;
+            }
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
             {
@@ -1409,6 +1490,10 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     }
     #[cfg(windows)]
     if let Some(list) = host_list(this) {
+        if crate::resource::overlaps_expanded(address, bytes as u64) {
+            tracing::warn!("immediate write to sampled R4G4 texture memory is unsupported");
+            return;
+        }
         list.defer_write(address as *mut u8, what, bytes);
         return;
     }

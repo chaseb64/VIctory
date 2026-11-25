@@ -45,6 +45,8 @@ pub mod pipeline;
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(any(windows, test))]
+mod r4g4;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

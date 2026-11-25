@@ -312,6 +312,11 @@ extern "system" fn check_feature_support(
         FORMAT_SUPPORT => {
             // SAFETY: checked size and non-null.
             let q = unsafe { &mut *data.cast::<[u32; 3]>() };
+            if q[0] == resource::R4G4_UNORM {
+                q[1] = resource::r4g4_support1();
+                q[2] = 0;
+                return S_OK;
+            }
             // shortcut: every use of every format; answer from the host
             // device once there is one.
             q[1] = 0x7fff_ffff;
@@ -323,7 +328,11 @@ extern "system" fn check_feature_support(
             let q = unsafe { &mut *data.cast::<[u32; 4]>() };
             // Format, sample count, flags in; one quality level out for the
             // counts the hardware has.
-            q[3] = u32::from(matches!(q[1], 1 | 2 | 4 | 8));
+            q[3] = if q[0] == resource::R4G4_UNORM {
+                u32::from(q[1] == 1 && resource::r4g4_support1() != 0)
+            } else {
+                u32::from(matches!(q[1], 1 | 2 | 4 | 8))
+            };
             S_OK
         }
         SHADER_MODEL => {

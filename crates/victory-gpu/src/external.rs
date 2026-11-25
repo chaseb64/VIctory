@@ -8,6 +8,7 @@ use windows::Win32::Graphics::Direct3D12::{
 };
 
 use crate::object::Object;
+use crate::resource::TextureEncoding;
 
 /// The host D3D12 device, created on first use; `None` without a host GPU.
 pub fn host_device() -> Option<ID3D12Device> {
@@ -25,7 +26,15 @@ pub fn host_texture(
     state: u32,
 ) -> Option<(ID3D12Resource, u32)> {
     let host = crate::list::host_list(list)?;
-    let texture = crate::resource::host_resource(resource)?.clone();
+    let copy = crate::resource::host_copy(resource)?;
+    if copy.encoding == TextureEncoding::R4G4Expanded {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!("an expanded R4G4 texture cannot be passed to a host library")
+        });
+        return None;
+    }
+    let texture = copy.texture.clone();
     crate::list::ensure_state(host, resource, state);
     let state = crate::host::legal_state(&texture, state);
     Some((texture, state))

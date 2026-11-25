@@ -313,6 +313,23 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        use crate::resource::R4G4_UNORM;
+        if g.is_some_and(|g| {
+            g.depth_format.0 as u32 == R4G4_UNORM
+                || g.targets
+                    .RTFormats
+                    .iter()
+                    .take(g.targets.NumRenderTargets as usize)
+                    .any(|format| format.0 as u32 == R4G4_UNORM)
+        }) {
+            return refuse(
+                "R4G4 render targets and depth views are unsupported",
+                shaders,
+            );
+        }
+        if g.is_some_and(|g| g.inputs.iter().any(|e| e.Format.0 as u32 == R4G4_UNORM)) {
+            return refuse("R4G4 vertex inputs are unsupported", shaders);
+        }
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),

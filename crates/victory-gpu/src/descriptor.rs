@@ -8,7 +8,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid};
-use crate::resource::{Memory, PAGEABLE_IIDS};
+use crate::resource::{self, Memory, PAGEABLE_IIDS, R4G4_UNORM};
 
 #[cfg(windows)]
 pub(crate) mod host;
@@ -299,16 +299,27 @@ pub(crate) extern "system" fn create_rtv(
     desc: *const [u32; 6],
     handle: u64,
 ) {
+    record_target(resource, desc, handle, RTV_TAG);
+}
+
+fn record_target(resource: This, desc: *const [u32; 6], handle: u64, tag: u32) {
     if handle == 0 {
         return;
     }
-    // SAFETY: the title passes a description or null.
-    let described = unsafe { desc.as_ref() };
+    let described = words(desc);
+    let tag = if resource::title_format(resource) == Some(R4G4_UNORM)
+        || described.is_some_and(|d| d[0] == R4G4_UNORM)
+    {
+        warn_r4g4_view("render target or depth");
+        0
+    } else {
+        tag
+    };
     let record = RtvRecord {
-        tag: RTV_TAG,
+        tag,
         described: u32::from(described.is_some()),
         resource,
-        desc: described.copied().unwrap_or_default(),
+        desc: described.unwrap_or_default(),
     };
     // SAFETY: the handle is a descriptor slot, at least 112 bytes.
     unsafe { (handle as *mut RtvRecord).write_unaligned(record) };
@@ -316,16 +327,12 @@ pub(crate) extern "system" fn create_rtv(
 
 /// Device method: a depth view, recorded as render target views are.
 pub(crate) extern "system" fn create_dsv(
-    this: This,
+    _: This,
     resource: This,
     desc: *const [u32; 6],
     handle: u64,
 ) {
-    create_rtv(this, resource, desc, handle);
-    if handle != 0 {
-        // SAFETY: just written by `create_rtv`.
-        unsafe { (handle as *mut u32).write_unaligned(DSV_TAG) };
-    }
+    record_target(resource, desc, handle, DSV_TAG);
 }
 const DSV_TAG: u32 = u32::from_le_bytes(*b"vDSV");
 
@@ -468,6 +475,28 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     (!desc.is_null()).then(|| unsafe { desc.read_unaligned() })
 }
 
+fn warn_r4g4_view(kind: &'static str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| tracing::warn!(kind, "unsupported R4G4 view"));
+}
+
+/// R4G4 can be sampled through its own format or the texture's defaults.
+/// Native textures cannot be reinterpreted as R4G4.
+fn r4g4_srv_allowed(resource_format: Option<u32>, desc: Option<&[u32]>) -> bool {
+    const TEXTURE_2D: u32 = 4;
+    const TEXTURE_2D_ARRAY: u32 = 5;
+    if resource_format == Some(R4G4_UNORM) {
+        desc.is_none_or(|d| {
+            matches!(d[0], 0 | R4G4_UNORM) && matches!(d[1], TEXTURE_2D | TEXTURE_2D_ARRAY)
+        })
+    } else {
+        !desc.is_some_and(|d| d[0] == R4G4_UNORM)
+    }
+}
+
+/// A placed view starts with the plain guest resource description.
+const PLACED_FORMAT: usize = 8;
+
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
     if let Some([lo, hi, size, _]) = words(desc) {
@@ -483,7 +512,17 @@ pub(crate) extern "system" fn create_srv(
     desc: *const [u32; 10],
     handle: u64,
 ) {
-    record(handle, View::Shader(resource as usize, words(desc)));
+    let desc = words(desc);
+    let allowed = desc
+        .as_ref()
+        .is_none_or(|d| r4g4_srv_allowed(resource::title_format(resource), Some(d)));
+    let resource = if allowed {
+        resource as usize
+    } else {
+        warn_r4g4_view("shader resource");
+        0
+    };
+    record(handle, View::Shader(resource, desc));
 }
 
 /// Device method.
@@ -494,7 +533,25 @@ pub(crate) extern "system" fn create_uav(
     desc: *const [u32; 10],
     handle: u64,
 ) {
-    let view = View::Unordered(resource as usize, counter as usize, words(desc));
+    let desc = words(desc);
+    let view = if resource::title_format(resource) == Some(R4G4_UNORM)
+        || desc.is_some_and(|d| d[0] == R4G4_UNORM)
+    {
+        warn_r4g4_view("unordered access");
+        let desc = desc.unwrap_or_else(|| {
+            let mut d = [0; 10];
+            d[0] = R4G4_UNORM;
+            d[1] = if resource::is_texture_array(resource) {
+                5
+            } else {
+                4
+            };
+            d
+        });
+        View::Unordered(0, 0, Some(desc))
+    } else {
+        View::Unordered(resource as usize, counter as usize, desc)
+    };
     record(handle, view);
 }
 
@@ -508,7 +565,15 @@ pub(crate) extern "system" fn create_placed_srv(
     handle: u64,
 ) {
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
-        record(handle, View::Placed(false, resource, desc));
+        // Address-only views can name remapped physical pages. R4G4
+        // requires the backing identity of a resource object.
+        let view = if resource[PLACED_FORMAT] != R4G4_UNORM && desc[0] != R4G4_UNORM {
+            View::Placed(false, resource, desc)
+        } else {
+            warn_r4g4_view("placed shader resource");
+            View::Shader(0, desc[..10].try_into().ok())
+        };
+        record(handle, view);
     }
 }
 
@@ -519,7 +584,13 @@ pub(crate) extern "system" fn create_placed_uav(
     handle: u64,
 ) {
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
-        record(handle, View::Placed(true, resource, desc));
+        let view = if resource[PLACED_FORMAT] == R4G4_UNORM || desc[0] == R4G4_UNORM {
+            warn_r4g4_view("placed unordered access");
+            View::Unordered(0, 0, desc[..10].try_into().ok())
+        } else {
+            View::Placed(true, resource, desc)
+        };
+        record(handle, view);
     }
 }
 
@@ -787,6 +858,71 @@ mod tests {
         assert_eq!(view(s3), view(s1));
         assert_eq!(view(at(0) + 8), None);
         heap[0] = 0;
+    }
+
+    #[test]
+    fn r4g4_views_require_a_resource_object_and_replace_rejected_slots() {
+        let null = std::ptr::null();
+        let mut slot = [0u64; 4];
+        let handle = slot.as_mut_ptr() as u64;
+        let mut resource = [0u32; 14];
+        resource[0] = 3; // texture 2D
+        resource[PLACED_FORMAT] = R4G4_UNORM;
+        let mut srv = [0u32; 16];
+        let map_g_r_one_zero = 0x1941;
+        srv[..10].copy_from_slice(&[R4G4_UNORM, 5, map_g_r_one_zero, 1, 2, 1, 2, 0, 0, 0]);
+        assert!(r4g4_srv_allowed(Some(R4G4_UNORM), None));
+        assert!(r4g4_srv_allowed(Some(R4G4_UNORM), Some(&srv)));
+        create_placed_srv(null, &resource, &srv, handle);
+        assert_eq!(
+            view(handle),
+            Some(View::Shader(0, srv[..10].try_into().ok()))
+        );
+
+        srv[0] = 0; // explicit UNKNOWN inherits the paired host format
+        assert!(r4g4_srv_allowed(Some(R4G4_UNORM), Some(&srv)));
+        create_placed_srv(null, &resource, &srv, handle);
+        assert_eq!(
+            view(handle),
+            Some(View::Shader(0, srv[..10].try_into().ok()))
+        );
+
+        srv[0] = 49; // a guest RG8 view would reinterpret the packed texture
+        assert!(!r4g4_srv_allowed(Some(R4G4_UNORM), Some(&srv)));
+        let mut native = resource;
+        native[PLACED_FORMAT] = srv[0];
+        create_placed_srv(null, &native, &srv, handle);
+        assert_eq!(view(handle), Some(View::Placed(false, native, srv)));
+
+        srv[0] = R4G4_UNORM;
+        create_placed_uav(null, &resource, &srv, handle);
+        assert_eq!(
+            view(handle),
+            Some(View::Unordered(0, 0, srv[..10].try_into().ok()))
+        );
+
+        resource[PLACED_FORMAT] = 61; // a native R8 texture cannot expose R4G4
+        assert!(!r4g4_srv_allowed(Some(resource[PLACED_FORMAT]), Some(&srv)));
+        create_placed_srv(null, &resource, &srv, handle);
+        assert_eq!(
+            view(handle),
+            Some(View::Shader(0, srv[..10].try_into().ok()))
+        );
+    }
+
+    #[test]
+    fn r4g4_writable_views_clear_previous_target_records() {
+        let null = std::ptr::null();
+        let mut slot = [0u64; 16];
+        let handle = slot.as_mut_ptr() as u64;
+        create_rtv(null, null, std::ptr::null(), handle);
+        assert!(rtv_record(handle).is_some());
+        create_rtv(null, null, &[R4G4_UNORM, 4, 0, 0, 0, 0], handle);
+        assert!(rtv_record(handle).is_none());
+        create_dsv(null, null, std::ptr::null(), handle);
+        assert!(dsv_record(handle).is_some());
+        create_dsv(null, null, &[R4G4_UNORM, 3, 0, 0, 0, 0], handle);
+        assert!(dsv_record(handle).is_none());
     }
 
     /// A released resource's views go stale; the same view of a new

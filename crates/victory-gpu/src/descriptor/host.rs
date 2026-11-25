@@ -10,8 +10,9 @@ use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::{VIEW_TAG, View, view_at};
+use super::{PLACED_FORMAT, VIEW_TAG, View, r4g4_srv_allowed, view_at};
 use crate::host::host;
+use crate::resource::{R4G4_UNORM, TextureEncoding};
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -1136,9 +1137,19 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
+            let format = desc.as_ref().map(|d| d[0]);
             if let Some(copy) = crate::resource::host_copy(resource) {
                 let texture = &copy.texture;
+                let expanded = copy.encoding == TextureEncoding::R4G4Expanded;
+                let paired = expanded.then_some(R4G4_UNORM);
+                if !r4g4_srv_allowed(paired, desc.as_ref().map(|d| d.as_slice())) {
+                    once!(format, "cannot reinterpret an R4G4 shader view");
+                    return None;
+                }
                 let mut desc = desc.as_ref().map(srv_desc);
+                if expanded && let Some(desc) = &mut desc {
+                    desc.Format = DXGI_FORMAT_R8G8_UNORM;
+                }
                 if desc.is_none() && !default_view(resource) {
                     return None;
                 }
@@ -1157,12 +1168,18 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
+                if format == Some(R4G4_UNORM) {
+                    return None;
+                }
                 buffer_srv(data as u64, len, srv_desc(desc), at)
             } else {
                 None
             }
         }
         View::Unordered(resource, _counter, desc) => {
+            if desc.as_ref().is_some_and(|d| d[0] == R4G4_UNORM) {
+                return None;
+            }
             let resource = *resource as crate::object::This;
             let Some(copy) = crate::resource::host_copy(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
@@ -1172,6 +1189,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     _ => None,
                 };
             };
+            if copy.encoding == TextureEncoding::R4G4Expanded {
+                return None;
+            }
             let texture = &copy.texture;
             // A depth texture's unordered views write its twin.
             // SAFETY: a live resource.
@@ -1215,6 +1235,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             Some(None)
         }
         View::Placed(unordered, resource, desc) => {
+            if resource[PLACED_FORMAT] == R4G4_UNORM || desc[0] == R4G4_UNORM {
+                return None;
+            }
             if let Some(view) = placed_texture(view) {
                 return make(&view, at);
             }
@@ -1251,7 +1274,7 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     let View::Placed(false, resource, desc) = view else {
         return None;
     };
-    if resource[0] == BUFFER {
+    if resource[0] == BUFFER || resource[PLACED_FORMAT] == R4G4_UNORM || desc[0] == R4G4_UNORM {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
@@ -1290,7 +1313,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Constant(..) => return null_buffer_view(at),
         _ => return null_view(at),
     };
-    let desc = if buffer {
+    let mut desc = if buffer {
         D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_UINT,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
@@ -1299,6 +1322,11 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     } else {
         null_uav_desc(dimension)
     };
+    if matches!(view, View::Unordered(_, _, Some(words)) if words[0] == R4G4_UNORM)
+        || matches!(view, View::Placed(true, _, words) if words[0] == R4G4_UNORM)
+    {
+        desc.Format = DXGI_FORMAT_R32_FLOAT;
+    }
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
         host.device.CreateUnorderedAccessView(

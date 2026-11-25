@@ -834,7 +834,9 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end);
+        let start = address & !(WINDOW - 1);
+        let end = end.checked_next_multiple_of(WINDOW)?;
+        return crate::resource::with_unexpanded_shadow(start, end, || loose(start, end - start));
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -874,9 +876,16 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
-fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+/// Whether an existing raw-address shadow covers any of `[start, end)`.
+pub(crate) fn loose_overlaps(start: u64, end: u64) -> bool {
+    LOOSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..(end, 0))
+        .any(|(&(at, len), _)| at + len > start)
+}
+
+fn loose(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());

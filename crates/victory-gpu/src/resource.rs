@@ -11,6 +11,8 @@ use std::ptr::NonNull;
 
 use victory_formats::texture;
 
+#[cfg(windows)]
+use crate::object::E_NOTIMPL;
 use crate::object::{
     self, E_INVALIDARG, E_OUTOFMEMORY, HEAP, HRESULT, Iid, Object, RESOURCE, S_OK, Table, This,
     guid,
@@ -110,7 +112,12 @@ const _: () = assert!(size_of::<HeapDesc>() == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
 
 const BUFFER: u32 = 1;
+const TEXTURE_2D: u32 = 3;
 const TEXTURE_3D: u32 = 4;
+
+pub(crate) const R4G4_UNORM: u32 = 190;
+#[cfg(any(windows, test))]
+pub(crate) const R4G4_HOST_FORMAT: u32 = 49; // DXGI_FORMAT_R8G8_UNORM
 
 /// Bytes per element and the element's width in texels (4 for block
 /// compression), by DXGI format number. `None` for 1-bit and video
@@ -125,7 +132,7 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
         23..=47 | 67 | 87..=93 | 116 | 117 | 189 | 191 => (4, 1),
         118..=120 => (3, 1),
         48..=59 | 68 | 69 | 85 | 86 | 115 => (2, 1),
-        60..=65 | 190 => (1, 1),
+        60..=65 | R4G4_UNORM => (1, 1),
         70..=72 | 79..=81 => (8, 4),
         73..=78 | 82..=84 | 94..=99 => (16, 4),
         _ => return None,
@@ -138,7 +145,6 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
 pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
     use texture::{Dimension, Swizzle, TextureDesc};
     const TEXTURE_1D: u32 = 2;
-    const TEXTURE_2D: u32 = 3;
     const RENDER_TARGET: u32 = 1;
     const DEPTH: u32 = 2;
     let dimension = match desc.dimension {
@@ -279,11 +285,19 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
+#[cfg(windows)]
 pub(crate) fn view_format(this: This) -> Option<u32> {
-    let own = pc_format(resource(this).desc.format);
-    let host = host_resource(this)?;
+    if this.is_null() {
+        return None;
+    }
+    let resource = resource(this);
+    let host = resource.host.as_deref()?;
+    let own = match host.encoding {
+        TextureEncoding::Native => pc_format(resource.desc.format),
+        TextureEncoding::R4G4Expanded => R4G4_HOST_FORMAT,
+    };
     // SAFETY: a live resource.
-    let format = unsafe { host.GetDesc() }.Format.0 as u32;
+    let format = unsafe { host.texture.GetDesc() }.Format.0 as u32;
     (format != own).then_some(own)
 }
 
@@ -316,11 +330,11 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
-    width: u32,
-    height: u32,
-    depth: u32,
-    row_pitch: u32,
+    pub(crate) format: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) depth: u32,
+    pub(crate) row_pitch: u32,
 }
 
 impl PlacedFootprint {
@@ -615,7 +629,9 @@ fn resource_attributes(info: AllocationInfo, heap_kind: u32) -> u64 {
 impl Memory {
     /// A committed resource's memory: from the title's allocator if the
     /// runtime named one, else our own; zeroed either way.
-    fn for_resource(info: AllocationInfo, heap_kind: u32) -> Result<Memory, HRESULT> {
+    fn for_resource(info: AllocationInfo, heap_kind: u32, format: u32) -> Result<Memory, HRESULT> {
+        #[cfg(not(windows))]
+        let _ = format;
         let Some(&(alloc, _)) = ALLOCATOR.get() else {
             return Memory::new(info);
         };
@@ -624,13 +640,23 @@ impl Memory {
         let attributes = resource_attributes(info, heap_kind);
         let ptr =
             NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
-        // SAFETY: the allocator handed out `size` bytes.
-        unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
-        Ok(Memory {
+        let memory = Memory {
             ptr,
             layout,
             attributes: Some(attributes),
-        })
+        };
+        #[cfg(windows)]
+        if format == R4G4_UNORM && !private_writable_memory(ptr.as_ptr() as usize, layout.size()) {
+            tracing::warn!(
+                address = format_args!("{ptr:p}"),
+                size = layout.size(),
+                "committed R4G4 needs private, writable backing from the title allocator"
+            );
+            return Err(E_INVALIDARG);
+        }
+        // SAFETY: the allocator handed out `size` writable bytes.
+        unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
+        Ok(memory)
     }
 
     /// `size` zeroed bytes aligned to `alignment` (a power of two).
@@ -666,6 +692,99 @@ impl Drop for Memory {
             // SAFETY: allocated in `new` with this layout.
             _ => unsafe { dealloc(self.ptr.as_ptr(), self.layout) },
         }
+    }
+}
+
+/// Check each region of a title allocation before zeroing it. The runtime
+/// can map the same physical pages at different addresses only through
+/// mapped sections, never through a committed private allocation.
+#[cfg(windows)]
+fn private_writable_memory(at: usize, len: usize) -> bool {
+    private_memory(at, len, true)
+}
+
+#[cfg(windows)]
+fn private_memory(mut at: usize, len: usize, write: bool) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_PRIVATE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_GUARD,
+        PAGE_READONLY, PAGE_READWRITE,
+    };
+    let Some(end) = at.checked_add(len) else {
+        return false;
+    };
+    while at < end {
+        let Some(info) = memory_region(at) else {
+            return false;
+        };
+        let mask = if write {
+            PAGE_READWRITE | PAGE_EXECUTE_READWRITE
+        } else {
+            PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READ
+        };
+        let allowed = info.Protect & mask != 0;
+        if info.State != MEM_COMMIT
+            || info.Type != MEM_PRIVATE
+            || !allowed
+            || info.Protect & PAGE_GUARD != 0
+        {
+            return false;
+        }
+        let base = info.BaseAddress as usize;
+        let Some(next) = base.checked_add(info.RegionSize) else {
+            return false;
+        };
+        if base > at || next <= at {
+            return false;
+        }
+        at = next;
+    }
+    len != 0
+}
+
+#[cfg(windows)]
+fn memory_region(at: usize) -> Option<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION> {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let size = size_of_val(&info);
+    // SAFETY: a valid output buffer of the requested size.
+    let n = unsafe { VirtualQuery(at as *const c_void, &mut info, size) };
+    (n == size).then_some(info)
+}
+
+/// An unknown native footprint can only alias the Windows allocation or
+/// reservation that contains its address. Its regions may differ in page
+/// protection or commitment while sharing the same allocation base.
+#[cfg(windows)]
+fn guest_allocation_end(address: u64) -> Option<u64> {
+    let mut at = usize::try_from(address).ok()?;
+    let mut info = memory_region(at)?;
+    let allocation = info.AllocationBase;
+    if allocation.is_null() {
+        return None;
+    }
+    loop {
+        let base = info.BaseAddress as usize;
+        let end = base.checked_add(info.RegionSize)?;
+        if base > at || end <= at {
+            return None;
+        }
+        let Some(next) = memory_region(end).filter(|info| info.AllocationBase == allocation) else {
+            return Some(end as u64);
+        };
+        at = end;
+        info = next;
+    }
+}
+
+#[cfg(windows)]
+fn guest_range_end(start: u64, size: Option<u64>) -> Option<u64> {
+    if let Some(size) = size {
+        start.checked_add(size.max(1))
+    } else {
+        // For an unmapped address, guard only its exact start. Unrelated
+        // reservations stay usable while the title supplies an allocation.
+        guest_allocation_end(start).or_else(|| start.checked_add(1))
     }
 }
 
@@ -766,10 +885,11 @@ struct Resource {
 ///
 /// One per texture memory (decision 0007, "One host texture per texture
 /// memory"): title textures at the same address with the same shape and
-/// element size share it, each viewing it in its own format.
+/// element size can share it when their host encoding agrees.
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    pub(crate) encoding: TextureEncoding,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// Formats views may take besides the texture's own family: the host
     /// took them as castable formats when it made the texture.
@@ -790,11 +910,12 @@ pub(crate) struct HostTexture {
 
 #[cfg(windows)]
 impl HostTexture {
-    /// A host texture made outside the title's resources (twins).
+    /// Takes ownership of a host resource, including private texture twins.
     pub(crate) fn new(
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
         state: u32,
         castable: Vec<u32>,
+        encoding: TextureEncoding,
     ) -> Self {
         let bytes = crate::host::host().map_or(0, |h| {
             // SAFETY: plain queries on a live resource.
@@ -804,6 +925,7 @@ impl HostTexture {
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
             texture,
+            encoding,
             state: state.into(),
             castable,
             host_written: false.into(),
@@ -992,10 +1114,80 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host.clone()
 }
 
+/// How a host texture stores its guest texels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum TextureEncoding {
+    Native,
+    R4G4Expanded,
+}
+
+impl TextureEncoding {
+    fn for_format(format: u32) -> Self {
+        if format == R4G4_UNORM {
+            Self::R4G4Expanded
+        } else {
+            Self::Native
+        }
+    }
+}
+
+/// The sampled 2D layouts for which every guest texel can be uploaded.
+#[cfg(any(windows, test))]
+fn sampled_r4g4(desc: &ResourceDesc) -> bool {
+    const DENY_SHADER_RESOURCE: u32 = 8;
+    desc.format == R4G4_UNORM
+        && desc.dimension == TEXTURE_2D
+        && desc.sample_count == 1
+        && desc.sample_quality == 0
+        && desc.flags & (USES | DENY_SHADER_RESOURCE) == 0
+        && texture_layout(desc).is_some_and(|t| t.planes[0].layout.addressable())
+}
+
+/// The sampled format capabilities guest 190 gets from the typed RG8 host
+/// resource. The expansion requires all of these for loads, filtering and mips.
+#[cfg(windows)]
+pub(crate) fn r4g4_support1() -> u32 {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8_UNORM;
+
+    static SUPPORT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *SUPPORT.get_or_init(|| {
+        let required = D3D12_FORMAT_SUPPORT1_TEXTURE2D.0
+            | D3D12_FORMAT_SUPPORT1_SHADER_LOAD.0
+            | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE.0
+            | D3D12_FORMAT_SUPPORT1_MIP.0;
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: DXGI_FORMAT_R8G8_UNORM,
+            ..Default::default()
+        };
+        let ok = crate::host::host().is_some_and(|host| {
+            // SAFETY: a plain query into the matching feature structure.
+            unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+            }
+            .is_ok()
+        });
+        if ok && support.Support1.0 & required == required {
+            required as u32
+        } else {
+            0
+        }
+    })
+}
+
+#[cfg(not(windows))]
+pub(crate) fn r4g4_support1() -> u32 {
+    0
+}
+
 /// The host description of a title texture: the same, without the
 /// console's layout and flags, in a format the host takes for its use.
-#[cfg(windows)]
-fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
+#[cfg(any(windows, test))]
+fn host_desc(desc: &ResourceDesc, encoding: TextureEncoding) -> Option<ResourceDesc> {
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
         return None;
@@ -1004,6 +1196,10 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
+    if encoding == TextureEncoding::R4G4Expanded {
+        d.format = R4G4_HOST_FORMAT;
+        return Some(d);
+    }
     // PC refuses depth targets that are also unordered-access (the console
     // allows both; Grand Theft Auto VI's shadow maps and material depth ask
     // for it): unordered views of such a texture write its twin
@@ -1027,16 +1223,17 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
 }
 
 const DEPTH: u32 = 2;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const UNORDERED: u32 = 4;
 /// Render target, depth, unordered access: what a host texture allows.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const USES: u32 = 0x7;
 
 /// What a texture memory is, for the one host texture it gets: its address
 /// and shape (the console's layout resolved, mips counted, and the bytes
 /// and texels of an element), and whether it is a depth texture (which
-/// cannot share with colour ones on the host).
+/// cannot share with colour ones on the host). The encoding separates
+/// packed guest memory whose host texels are expanded from native aliases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct MemoryKey {
     address: u64,
@@ -1049,6 +1246,7 @@ pub(crate) struct MemoryKey {
     swizzle: u32,
     element: (u64, u64),
     depth: bool,
+    encoding: TextureEncoding,
 }
 
 /// The texture memory `desc` describes at `address`; `None` for buffers
@@ -1068,6 +1266,7 @@ pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey>
         swizzle: texture_layout(desc).map_or(desc.layout, |t| t.planes[0].layout.desc.swizzle.0),
         element: element(desc.format)?,
         depth: desc.flags & DEPTH != 0,
+        encoding: TextureEncoding::for_format(desc.format),
     })
 }
 
@@ -1100,18 +1299,18 @@ static MEMORY: std::sync::Mutex<
 /// else a new one, which becomes the memory's.
 #[cfg(windows)]
 fn shared_texture(
-    address: u64,
     desc: &ResourceDesc,
+    key: Option<MemoryKey>,
+    encoding: TextureEncoding,
     state: u32,
     clear: *const c_void,
 ) -> Option<std::sync::Arc<HostTexture>> {
-    let d = host_desc(desc)?;
-    let key = memory_key(address, desc);
+    let d = host_desc(desc, encoding)?;
     let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
     let live = key.and_then(|k| map.get(&k)?.upgrade());
     if let Some(t) = &live
-        && takes(t, &d)
+        && takes(t, &d, encoding)
     {
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(host) = crate::host::host() {
@@ -1124,7 +1323,7 @@ fn shared_texture(
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
-    let t = std::sync::Arc::new(make_texture(&d, state, clear)?);
+    let t = std::sync::Arc::new(make_texture(&d, encoding, state, clear)?);
     if let Some(k) = key {
         if live.is_some() {
             REPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1142,7 +1341,10 @@ fn shared_texture(
 /// `d` at its memory: its uses, and a view format of its family or
 /// castable list.
 #[cfg(windows)]
-fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
+fn takes(t: &HostTexture, d: &ResourceDesc, encoding: TextureEncoding) -> bool {
+    if t.encoding != encoding {
+        return false;
+    }
     // SAFETY: a live resource.
     let td = unsafe { t.texture.GetDesc() };
     let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
@@ -1169,7 +1371,12 @@ fn current(this: This) -> bool {
 /// [`castable`]'s formats (colour textures, through the enhanced-barrier
 /// creation; it starts in the common state) where the host takes that.
 #[cfg(windows)]
-fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<HostTexture> {
+fn make_texture(
+    d: &ResourceDesc,
+    encoding: TextureEncoding,
+    state: u32,
+    clear: *const c_void,
+) -> Option<HostTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     use windows::core::Interface;
@@ -1188,7 +1395,11 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
-    let mut castable_formats = if d.flags & DEPTH == 0 { castable(d.format) } else { Vec::new() };
+    let mut castable_formats = if d.flags & DEPTH == 0 && encoding == TextureEncoding::Native {
+        castable(d.format)
+    } else {
+        Vec::new()
+    };
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
     if !castable_formats.is_empty()
         && let Ok(device) = host.device.cast::<ID3D12Device10>()
@@ -1259,7 +1470,12 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         format!("texture {}x{} f{} flags {:#x} @{:#x}", d.width, d.height, d.format, d.flags, texture.as_raw() as usize)
     });
     let initial = crate::host::legal_state(&texture, initial);
-    Some(HostTexture::new(texture, initial, castable_formats))
+    Some(HostTexture::new(
+        texture,
+        initial,
+        castable_formats,
+        encoding,
+    ))
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -1276,6 +1492,10 @@ pub(crate) fn title_format(this: This) -> Option<u32> {
     (!this.is_null()).then(|| resource(this).desc.format)
 }
 
+pub(crate) fn is_texture_array(this: This) -> bool {
+    !this.is_null() && resource(this).desc.depth_or_array_size > 1
+}
+
 /// A buffer's host memory and size; `None` for textures.
 pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     if this.is_null() {
@@ -1283,6 +1503,35 @@ pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     }
     let r = resource(this);
     (r.desc.dimension == BUFFER).then(|| (r.data(), r.desc.width))
+}
+
+/// A packed-copy source dedicated to CPU uploads. Its bytes come from
+/// guest memory and never from a GPU-authored shadow.
+#[cfg(windows)]
+pub(crate) fn sampled_copy_buffer(this: This) -> Option<(*mut u8, u64)> {
+    const UPLOAD_HEAP: u32 = 2;
+    let bytes = buffer_bytes(this)?;
+    let r = resource(this);
+    if r.heap.kind != UPLOAD_HEAP
+        || r.desc.flags & UNORDERED != 0
+        || matches!(r.backing, Backing::Address(_))
+    {
+        return None;
+    }
+    let start = bytes.0 as u64;
+    let end = start.checked_add(bytes.1)?;
+    let ranges = RESOURCE_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    if intersecting(&ranges.native, start, end).any(|s| s.resource != this as usize)
+        || crate::shadow::loose_overlaps(start, end)
+    {
+        return None;
+    }
+    if matches!(&r.backing, Backing::Committed(m) if m.attributes.is_some())
+        && !private_memory(start as usize, usize::try_from(bytes.1).ok()?, false)
+    {
+        return None;
+    }
+    Some(bytes)
 }
 
 impl Resource {
@@ -1311,6 +1560,7 @@ fn resource<'a>(this: This) -> &'a Resource {
 #[allow(clippy::too_many_arguments)]
 fn hand_out_resource(
     desc: ResourceDesc,
+    backing_size: Option<u64>,
     heap: HeapProperties,
     heap_flags: u32,
     backing: Backing,
@@ -1320,7 +1570,36 @@ fn hand_out_resource(
     out: *mut This,
 ) -> HRESULT {
     #[cfg(not(windows))]
-    let _ = (state, clear);
+    let _ = (backing_size, state, clear);
+    #[cfg(windows)]
+    if desc.format == R4G4_UNORM {
+        if !out.is_null() {
+            // SAFETY: the title passes room for the resource pointer.
+            unsafe { out.write(std::ptr::null()) };
+        }
+        const SAMPLED_COPY_STATES: u32 = 0x40 | 0x80 | 0x400 | 0x800;
+        const DEFAULT_HEAP: u32 = 1;
+        // Committed memory was checked in `Memory::for_resource`, and
+        // `create_heap` owns its allocation. Raw addresses lack provenance.
+        let known_backing = !matches!(backing, Backing::Address(_));
+        if !sampled_r4g4(&desc)
+            || !clear.is_null()
+            || crate::host::texture_state(state) & !SAMPLED_COPY_STATES != 0
+            || !known_backing
+            || heap.kind != DEFAULT_HEAP
+        {
+            tracing::warn!(
+                ?desc,
+                state,
+                "unsupported R4G4 resource description, state, or backing"
+            );
+            return E_INVALIDARG;
+        }
+        if r4g4_support1() == 0 {
+            tracing::warn!("the host cannot sample R4G4 through R8G8_UNORM");
+            return E_NOTIMPL;
+        }
+    }
     #[allow(unused_mut)] // the host texture is set on Windows only
     let mut resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
@@ -1333,28 +1612,148 @@ fn hand_out_resource(
     });
     #[cfg(windows)]
     {
-        resource.host = shared_texture(resource.data() as u64, &desc, state, clear);
+        let start = resource.data() as u64;
+        let Some(end) = guest_range_end(start, backing_size) else {
+            return E_INVALIDARG;
+        };
+        let encoding = TextureEncoding::for_format(desc.format);
+        let key = memory_key(start, &desc);
+        let packed_key = key.filter(|key| key.encoding == TextureEncoding::R4G4Expanded);
+        let mut ranges = RESOURCE_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        if !ranges.permits(start, end, packed_key) {
+            if !out.is_null() {
+                // SAFETY: the title passes room for the resource pointer.
+                unsafe { out.write(std::ptr::null()) };
+            }
+            tracing::warn!(
+                ?desc,
+                start,
+                end,
+                "unsupported alias of packed R4G4 texture memory"
+            );
+            return E_INVALIDARG;
+        }
+        resource.host = shared_texture(&desc, key, encoding, state, clear);
+        if encoding == TextureEncoding::R4G4Expanded && resource.host.is_none() {
+            return E_NOTIMPL;
+        }
+        ranges.register(&resource, start, end, packed_key);
     }
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
-    } else if resource.host.is_some() {
-        let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
-        map.entry(resource.data() as u64).or_default().push(at);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
 
-/// Title textures with a host copy, by the console memory they start at.
-/// Title textures of one memory share a host texture where the host can
-/// view it in each one's format; where it cannot (block-compressed against
-/// plain formats, a cast the host refused, a host texture replaced),
-/// [`alias_source`] finds the one the GPU writes.
 #[cfg(windows)]
-static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+struct ResourceSpan {
+    end: u64,
+    resource: usize,
+    /// A packed resource can only overlap another object with the same key.
+    key: Option<MemoryKey>,
+}
+
+#[cfg(windows)]
+type Spans = std::collections::BTreeMap<u64, Vec<ResourceSpan>>;
+
+/// Live guest resource ranges, including buffers. Expanded storage cannot
+/// see incompatible GPU writes to the same guest bytes.
+#[cfg(windows)]
+struct ResourceRanges {
+    native: Spans,
+    expanded: Spans,
+}
+
+#[cfg(windows)]
+static RESOURCE_RANGES: std::sync::Mutex<ResourceRanges> = std::sync::Mutex::new(ResourceRanges {
+    native: Spans::new(),
+    expanded: Spans::new(),
+});
+
+#[cfg(windows)]
+fn intersecting(spans: &Spans, start: u64, end: u64) -> impl Iterator<Item = &ResourceSpan> {
+    spans
+        .range(..end)
+        .flat_map(|(_, spans)| spans)
+        .filter(move |span| span.end > start)
+}
+
+/// Whether a raw guest byte range overlaps a live expanded texture.
+#[cfg(windows)]
+pub(crate) fn overlaps_expanded(start: u64, len: u64) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let Some(end) = start.checked_add(len) else {
+        return true;
+    };
+    let ranges = RESOURCE_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    intersecting(&ranges.expanded, start, end).next().is_some()
+}
+
+#[cfg(windows)]
+impl ResourceRanges {
+    fn register(&mut self, resource: &Resource, start: u64, end: u64, key: Option<MemoryKey>) {
+        if resource.desc.dimension != BUFFER && resource.host.is_none() {
+            return;
+        }
+        let encoding = TextureEncoding::for_format(resource.desc.format);
+        self.for_encoding_mut(encoding)
+            .entry(start)
+            .or_default()
+            .push(ResourceSpan {
+                end,
+                resource: std::ptr::from_ref(resource) as usize,
+                key,
+            });
+    }
+
+    fn for_encoding(&self, encoding: TextureEncoding) -> &Spans {
+        match encoding {
+            TextureEncoding::Native => &self.native,
+            TextureEncoding::R4G4Expanded => &self.expanded,
+        }
+    }
+
+    fn for_encoding_mut(&mut self, encoding: TextureEncoding) -> &mut Spans {
+        match encoding {
+            TextureEncoding::Native => &mut self.native,
+            TextureEncoding::R4G4Expanded => &mut self.expanded,
+        }
+    }
+
+    fn permits(&self, start: u64, end: u64, key: Option<MemoryKey>) -> bool {
+        !intersecting(&self.expanded, start, end).any(|span| span.key != key)
+            && (key.is_none()
+                || intersecting(&self.native, start, end).next().is_none()
+                    && !crate::shadow::loose_overlaps(start, end))
+    }
+}
+
+/// Checks the whole range a raw shader address can access through a loose
+/// shadow. Keep the range lock until the shadow is registered.
+#[cfg(windows)]
+pub(crate) fn with_unexpanded_shadow<T>(
+    start: u64,
+    end: u64,
+    make: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    let ranges = RESOURCE_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    if intersecting(&ranges.expanded, start, end).next().is_some() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                start,
+                end,
+                "a buffer view overlaps packed R4G4 texture memory"
+            )
+        });
+        return None;
+    }
+    make()
+}
 
 /// For a texture made for a placed view (`texture_at`): a title texture
 /// the GPU writes (render target, depth or unordered access) at the same
@@ -1368,7 +1767,8 @@ static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>
 pub(crate) fn alias_source(placed: This) -> Option<This> {
     const WRITTEN: u32 = 0x7; // render target, depth, unordered access
     let b = resource(placed);
-    let map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let encoding = b.host.as_ref()?.encoding;
+    let ranges = RESOURCE_RANGES.lock().unwrap_or_else(|e| e.into_inner());
     let bytes = |d: &ResourceDesc| {
         let (size, block) = element(d.format)?;
         let swizzle = texture_layout(d).map_or(d.layout, |t| t.planes[0].layout.desc.swizzle.0);
@@ -1376,15 +1776,21 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         Some((d.dimension, d.width.div_ceil(block) * size, rows, d.depth_or_array_size, d.sample_count, swizzle))
     };
     let want = bytes(&b.desc)?;
-    map.get(&(b.data() as u64))?
+    ranges
+        .for_encoding(encoding)
+        .get(&(b.data() as u64))?
         .iter()
-        .map(|&r| r as This)
+        .map(|span| span.resource as This)
         .filter(|&r| r != placed)
         .find(|&r| {
             let a = resource(r);
+            let (Some(x), Some(y)) = (&a.host, &b.host) else {
+                return false;
+            };
             a.desc.flags & WRITTEN != 0
                 && bytes(&a.desc) == Some(want)
-                && matches!((&a.host, &b.host), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(x, y))
+                && x.encoding == y.encoding
+                && !std::sync::Arc::ptr_eq(x, y)
         })
 }
 
@@ -1415,23 +1821,24 @@ impl Drop for Resource {
             life::note(h.texture.as_raw() as usize, life::RELEASED, 0, life::holders(&h.texture));
         }
         crate::bindless::forget(std::ptr::from_ref::<Resource>(self) as usize);
-        if self.desc.dimension != BUFFER {
-            let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
-            let at = self.data() as u64;
-            if let Some(list) = map.get_mut(&at) {
-                list.retain(|&r| r != std::ptr::from_ref::<Resource>(self) as usize);
-                if list.is_empty() {
-                    map.remove(&at);
-                }
-            }
-        }
-        crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(
                 std::ptr::from_ref::<Resource>(self) as usize,
                 self.data() as u64,
             );
         }
+        {
+            let mut ranges = RESOURCE_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+            let map = ranges.for_encoding_mut(TextureEncoding::for_format(self.desc.format));
+            let at = self.data() as u64;
+            if let Some(list) = map.get_mut(&at) {
+                list.retain(|span| span.resource != std::ptr::from_ref::<Resource>(self) as usize);
+                if list.is_empty() {
+                    map.remove(&at);
+                }
+            }
+        }
+        crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
     }
 }
 
@@ -1459,12 +1866,18 @@ pub(crate) extern "system" fn create_committed(
         heap = heap.kind,
         "committed resource"
     );
-    let memory = match Memory::for_resource(info, heap.kind) {
+    #[cfg(windows)]
+    if desc.format == R4G4_UNORM && !out.is_null() {
+        // SAFETY: the title passes room for the resource pointer.
+        unsafe { out.write(std::ptr::null()) };
+    }
+    let memory = match Memory::for_resource(info, heap.kind, desc.format) {
         Ok(memory) => memory,
         Err(hr) => return hr,
     };
     hand_out_resource(
         desc,
+        Some(info.size),
         heap,
         heap_flags,
         Backing::Committed(memory),
@@ -1495,6 +1908,34 @@ pub(crate) extern "system" fn create_committed3(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    #[cfg(windows)]
+    // SAFETY: the title passes a description or null.
+    if unsafe { desc.as_ref() }.is_some_and(|d| d.format == R4G4_UNORM) {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let layout = D3D12_BARRIER_LAYOUT(_layout as i32);
+        if !matches!(
+            layout,
+            D3D12_BARRIER_LAYOUT_UNDEFINED
+                | D3D12_BARRIER_LAYOUT_COMMON
+                | D3D12_BARRIER_LAYOUT_GENERIC_READ
+                | D3D12_BARRIER_LAYOUT_SHADER_RESOURCE
+                | D3D12_BARRIER_LAYOUT_COPY_SOURCE
+                | D3D12_BARRIER_LAYOUT_COPY_DEST
+        ) || _castable_count != 0
+            || !_protected.is_null()
+        {
+            if !out.is_null() {
+                // SAFETY: the title passes room for the resource pointer.
+                unsafe { out.write(std::ptr::null()) };
+            }
+            tracing::warn!(
+                _layout,
+                _castable_count,
+                "unsupported enhanced R4G4 resource options"
+            );
+            return E_INVALIDARG;
+        }
+    }
     const COMMON: u32 = 0;
     create_committed(this, heap, heap_flags, desc, COMMON, clear, iid, out)
 }
@@ -1577,6 +2018,7 @@ pub(crate) extern "system" fn create_at_address(
     };
     hand_out_resource(
         desc,
+        footprint(&desc).map(|info| info.size),
         DEFAULT,
         0,
         Backing::Address(address as *mut u8),
@@ -1634,8 +2076,12 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
+    if resource(out).host.is_none() {
+        resource_release(out);
+        return None;
+    }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    Some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -1657,13 +2103,13 @@ pub(crate) extern "system" fn create_placed(
     }
     // SAFETY: the title passes one of our heaps.
     let h = unsafe { &*heap.cast::<Heap>() };
-    let fits = footprint(&desc).is_some_and(|info| {
+    let fits = footprint(&desc).filter(|info| {
         offset.is_multiple_of(info.alignment)
             && offset
                 .checked_add(info.size)
                 .is_some_and(|end| end <= h.desc.size)
     });
-    if !fits {
+    let Some(info) = fits else {
         tracing::warn!(
             ?desc,
             offset,
@@ -1671,11 +2117,12 @@ pub(crate) extern "system" fn create_placed(
             "placed resource does not fit"
         );
         return E_INVALIDARG;
-    }
+    };
     object::add_ref(heap);
     let backing = Backing::Placed { heap, offset };
     hand_out_resource(
         desc,
+        Some(info.size),
         h.desc.properties,
         h.desc.flags,
         backing,
@@ -1852,6 +2299,12 @@ mod tests {
     use super::*;
     use crate::object::slot;
 
+    #[cfg(windows)]
+    mod r4g4_gpu_test {
+        use super::*;
+        include!("resource/r4g4_gpu_test.rs");
+    }
+
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {
         // DXGI_FORMAT values: 60 R8_TYPELESS, 61 R8_UNORM, 62 R8_UINT,
@@ -1940,6 +2393,260 @@ mod tests {
         assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { layout: 0x102, ..a }));
         assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { flags: 2, format: 40, ..a }));
         assert_eq!(memory_key(0x1_0000, &buffer(256)), None);
+    }
+
+    #[test]
+    fn sampled_r4g4_layouts_have_a_separate_host_identity() {
+        let packed = texture(129, 9, R4G4_UNORM, 5);
+        let r8 = ResourceDesc {
+            format: 61,
+            ..packed
+        };
+        let address = 0x1_0000;
+        assert_eq!(element(packed.format), element(r8.format));
+        let packed_key = memory_key(address, &packed).unwrap();
+        assert_ne!(Some(packed_key), memory_key(address, &r8));
+        assert_eq!(packed_key.encoding, TextureEncoding::R4G4Expanded);
+        assert_eq!(
+            Some(packed_key),
+            memory_key(
+                address,
+                &ResourceDesc {
+                    layout: 0x105,
+                    ..packed
+                }
+            )
+        );
+
+        assert!(sampled_r4g4(&packed));
+        assert!(sampled_r4g4(&ResourceDesc {
+            depth_or_array_size: 2,
+            layout: 1,
+            ..packed
+        }));
+        for unsupported in [
+            ResourceDesc {
+                layout: 0x119,
+                ..packed
+            },
+            ResourceDesc {
+                dimension: TEXTURE_3D,
+                ..packed
+            },
+            ResourceDesc {
+                sample_count: 4,
+                mip_levels: 1,
+                ..packed
+            },
+            ResourceDesc {
+                sample_quality: 1,
+                ..packed
+            },
+            ResourceDesc { flags: 1, ..packed },
+            ResourceDesc { flags: 2, ..packed },
+            ResourceDesc { flags: 4, ..packed },
+            ResourceDesc { flags: 8, ..packed },
+        ] {
+            assert!(!sampled_r4g4(&unsupported), "{unsupported:?}");
+        }
+    }
+
+    #[test]
+    fn r4g4_host_description_is_typed_rg8_and_keeps_guest_layout() {
+        let guest = ResourceDesc {
+            layout: 1,
+            ..texture(129, 9, R4G4_UNORM, 1)
+        };
+        let encoding = TextureEncoding::for_format(guest.format);
+        let host = host_desc(&guest, encoding).unwrap();
+        assert_eq!(host.format, 49);
+        assert_eq!(host.layout, 0);
+        assert_eq!(guest.format, 190);
+        assert_eq!(pc_format(guest.format), 190);
+        assert_eq!(subresource(&guest, 0).unwrap().2, 129);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn r4g4_title_allocator_requires_every_page_to_be_committed_and_private() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+            MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile, VirtualAlloc, VirtualFree,
+        };
+
+        let half = KIB_64 as usize;
+        let len = 2 * half;
+        let null = std::ptr::null();
+        // SAFETY: a private reservation; each half is committed separately.
+        unsafe {
+            let private = VirtualAlloc(null, len, MEM_RESERVE, PAGE_READWRITE);
+            assert!(!private.is_null());
+            assert_eq!(
+                VirtualAlloc(private, half, MEM_COMMIT, PAGE_READWRITE),
+                private
+            );
+            assert!(private_writable_memory(private as usize, half));
+            assert!(!private_writable_memory(private as usize, len));
+            let second = private.cast::<u8>().add(half).cast::<c_void>();
+            assert_eq!(
+                VirtualAlloc(second, half, MEM_COMMIT, PAGE_READWRITE),
+                second
+            );
+            assert!(private_writable_memory(private as usize, len));
+            assert_ne!(VirtualFree(private, 0, MEM_RELEASE), 0);
+        }
+
+        // SAFETY: an anonymous section and writable view, both owned here.
+        unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                null.cast(),
+                PAGE_READWRITE,
+                0,
+                len as u32,
+                null.cast(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len);
+            assert!(!view.Value.is_null());
+            assert!(!private_writable_memory(view.Value as usize, len));
+            assert_ne!(UnmapViewOfFile(view), 0);
+            assert_ne!(CloseHandle(section), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn r4g4_unknown_native_alias_is_bounded_by_its_reservation() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let half = KIB_64 as usize;
+        // SAFETY: a private reservation; the first half is committed.
+        unsafe {
+            let reservation = VirtualAlloc(std::ptr::null(), 2 * half, MEM_RESERVE, PAGE_READWRITE);
+            assert!(!reservation.is_null());
+            assert_eq!(
+                VirtualAlloc(reservation, half, MEM_COMMIT, PAGE_READWRITE),
+                reservation
+            );
+            let base = reservation as u64;
+            assert_eq!(guest_range_end(base + 64, None), Some(base + 2 * KIB_64));
+            assert_ne!(VirtualFree(reservation, 0, MEM_RELEASE), 0);
+        }
+        assert_eq!(guest_range_end(0, None), Some(1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn r4g4_unknown_native_placeholder_does_not_block_private_backing() {
+        let backing = Memory::zeroed(KIB_64, KIB_64).unwrap();
+        let start = backing.address();
+        let placeholder = Resource {
+            object: Object::new(&RESOURCE_FUNCTIONS),
+            desc: texture(129, 9, 103, 1), // Native NV12 has no guest footprint.
+            heap: PROPERTIES,
+            heap_flags: 0,
+            backing: Backing::Address(start as *mut u8),
+            host: None,
+        };
+        assert!(footprint(&placeholder.desc).is_none());
+        let mut ranges = ResourceRanges {
+            native: Spans::new(),
+            expanded: Spans::new(),
+        };
+        let end = guest_range_end(start, None).unwrap();
+        ranges.register(&placeholder, start, end, None);
+        assert!(ranges.native.is_empty());
+        let other = end.checked_add(KIB_64).unwrap();
+        assert!(intersecting(&ranges.native, other, other + KIB_64).next().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn r4g4_creation_keeps_the_guest_format_and_separates_native_aliases() {
+        let null = std::ptr::null();
+        let packed = texture(129, 9, R4G4_UNORM, 1);
+        let bad = ResourceDesc { flags: 4, ..packed };
+        let mut out = std::ptr::dangling();
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &bad,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut out
+            ),
+            E_INVALIDARG
+        );
+        assert!(out.is_null());
+
+        if r4g4_support1() == 0 {
+            return;
+        }
+        let heap = heap(1 << 20);
+        let r8 = ResourceDesc {
+            format: 61,
+            flags: 1,
+            layout: 0x105,
+            ..packed
+        };
+        let place = |desc: &ResourceDesc, out: &mut This| {
+            create_placed(null, heap, 0, desc, 0, null.cast(), &RESOURCE_IIDS[0], out)
+        };
+        let mut native = null;
+        assert_eq!(place(&r8, &mut native), S_OK);
+        assert_eq!(host_copy(native).unwrap().encoding, TextureEncoding::Native);
+        let mut placed = std::ptr::dangling();
+        assert_eq!(place(&packed, &mut placed), E_INVALIDARG);
+        assert!(placed.is_null());
+        resource_release(native);
+
+        let mut placed = null;
+        assert_eq!(place(&packed, &mut placed), S_OK);
+        let expanded = host_copy(placed).unwrap();
+        assert_eq!(expanded.encoding, TextureEncoding::R4G4Expanded);
+        assert!(expanded.castable.is_empty());
+        // SAFETY: a live host resource.
+        let host_format = unsafe { expanded.texture.GetDesc() }.Format;
+        assert_eq!(host_format.0 as u32, R4G4_HOST_FORMAT);
+        assert_eq!(title_format(placed), Some(R4G4_UNORM));
+        assert_eq!(subresource(&resource(placed).desc, 0).unwrap().2, 129);
+        assert_eq!(view_format(placed), None);
+
+        let mut native = std::ptr::dangling();
+        assert_eq!(place(&r8, &mut native), E_INVALIDARG);
+        assert!(native.is_null());
+        assert_eq!(alias_source(placed), None);
+
+        let address = gpu_address(placed);
+        let mut overlapping_buffer = std::ptr::dangling();
+        assert_eq!(
+            create_at_address(
+                null,
+                address + 64,
+                &buffer(256),
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut overlapping_buffer
+            ),
+            E_INVALIDARG,
+        );
+        assert!(overlapping_buffer.is_null());
+        assert!(crate::shadow::find(address + 64, 256).is_none());
+        let words = [3, 0, 0, 0, 129, 0, 9, 0x1_0001, R4G4_UNORM, 1, 0, 0, 0, 0];
+        assert!(texture_at(address, &words).is_none());
+        let mut same = null;
+        assert_eq!(place(&packed, &mut same), S_OK);
+        assert!(std::sync::Arc::ptr_eq(&host_copy(same).unwrap(), &expanded));
+        resource_release(same);
+        resource_release(placed);
+        heap_release(heap);
     }
 
     /// Castable formats: every format of the same element but typeless and

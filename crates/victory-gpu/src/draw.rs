@@ -1864,7 +1864,7 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -1891,7 +1891,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 
     /// A compute shader with its root signature inside (`RS`).
-    fn compile_cs(source: &str) -> (ID3D12RootSignature, ID3D12PipelineState) {
+    pub(crate) fn compile_cs(source: &str) -> (ID3D12RootSignature, ID3D12PipelineState) {
         let host = crate::host::host().unwrap();
         let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
         // SAFETY: the source and names outlive the call.

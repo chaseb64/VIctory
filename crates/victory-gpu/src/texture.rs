@@ -45,6 +45,7 @@ pub(crate) struct Staging {
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
+    pub(crate) expanded: bool,
     memory: *const u8,
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
@@ -56,6 +57,7 @@ pub(crate) struct Staging {
 /// (memory not tracked), with room to read tracked memory into.
 #[derive(Default)]
 struct Last {
+    valid: bool,
     hash: Option<blake3::Hash>,
     read: Vec<u8>,
 }
@@ -108,6 +110,12 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     ) else {
         return;
     };
+    if crate::resource::title_format(from) == Some(crate::resource::R4G4_UNORM)
+        || crate::resource::title_format(to) == Some(crate::resource::R4G4_UNORM)
+    {
+        tracing::warn!("unsupported alias copy involving sampled R4G4");
+        return;
+    }
     // An odd key: textures' own first uses are keyed by the host texture.
     if !list.first_use(to as usize | 1) {
         return;
@@ -199,6 +207,14 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if is_host_written(resource) || !list.first_use(texture.as_raw() as usize) {
         return;
     }
+    if crate::resource::title_format(resource) == Some(crate::resource::R4G4_UNORM) {
+        crate::r4g4::keep(list, resource);
+        let staging = copy_staging(resource, texture).unwrap_or_else(|| {
+            crate::host::fail(format_args!("could not stage sampled R4G4 texture"))
+        });
+        record_snapshot(list, resource, texture, staging);
+        return;
+    }
     let Some(staging) = staging(resource, texture) else {
         return;
     };
@@ -221,7 +237,9 @@ pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Re
     let Some(staging) = staging(resource, texture) else {
         return false;
     };
-    if !staging.refresh() {
+    // An explicit copy can replace the host image between bindless uses,
+    // even when the packed memory once again hashes to its earlier value.
+    if !staging.refresh() && !staging.expanded {
         return false;
     }
     record(list, resource, texture, &staging);
@@ -290,6 +308,9 @@ impl Staging {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let (read, changed) = self.refresh_now();
+        if self.expanded && !self.last.lock().unwrap_or_else(|e| e.into_inner()).valid {
+            crate::host::fail(format_args!("sampled R4G4 staging could not be initialized"));
+        }
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
@@ -303,19 +324,28 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some(t) = &self.tracked {
-            if t.take(start, start + size).is_empty() {
+            if t.take(start, start + size).is_empty() && last.valid {
                 return (0, false);
             }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             last.read.resize(size, 0);
             crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            last.valid = self.detile(&last.read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return (size, true);
+            return (size, last.valid);
         }
         if !committed(self.memory, size) {
+            if self.expanded {
+                // Sparse streamed memory uses the same zero-filled holes as
+                // the watched path. Never submit an uninitialized RG8 buffer.
+                last.read.resize(size, 0);
+                crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
+                last.valid = self.detile(&last.read);
+                last.hash = None;
+                return (size, last.valid);
+            }
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -333,15 +363,15 @@ impl Staging {
         if last.hash == Some(hash) {
             return (size, false);
         }
-        last.hash = Some(hash);
-        self.detile(tiled);
+        last.valid = self.detile(tiled);
+        last.hash = last.valid.then_some(hash);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        (size, true)
+        (size, last.valid)
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
+    fn detile(&self, tiled: &[u8]) -> bool {
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -366,9 +396,16 @@ impl Staging {
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
+                return false;
+            }
+            if self.expanded
+                && !crate::r4g4::expand_rows(linear, f.Width as usize, rows as usize, pitch)
+            {
+                tracing::warn!(mip, slice, "invalid RG8 staging footprint");
+                return false;
             }
         }
+        true
     }
 }
 
@@ -387,8 +424,17 @@ fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64)
 /// Whether `[at, at + len)` is committed, readable memory (streamed textures
 /// may be unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+    accessible(at, len, false)
+}
+
+pub(crate) fn writable(at: *const u8, len: usize) -> bool {
+    accessible(at, len, true)
+}
+
+fn accessible(at: *const u8, len: usize, write: bool) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
     };
     let mut p = at as usize;
     let Some(end) = p.checked_add(len) else {
@@ -399,9 +445,11 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        let unreadable = info.Protect == 0
-            || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0;
-        if n == 0 || info.State != MEM_COMMIT || unreadable {
+        let unreadable = info.Protect == 0 || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0;
+        let read_only = info.Protect
+            & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+            == 0;
+        if n == 0 || info.State != MEM_COMMIT || unreadable || (write && read_only) {
             return false;
         }
         let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
@@ -421,6 +469,25 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     if let Some(s) = held.as_ref() {
         return Some(s.clone());
     }
+    let made = copy_staging(resource, texture)?;
+    *held = Some(made.clone());
+    Some(made)
+}
+
+/// A copy at a distinct command position needs its own mapped bytes until
+/// the queue fence completes. Sharing the bindless staging here would let
+/// a later deferred upload overwrite the bytes of an earlier draw.
+pub(crate) fn record_snapshot(
+    list: &HostList,
+    resource: This,
+    texture: &ID3D12Resource,
+    staging: Arc<Staging>,
+) {
+    record(list, resource, texture, &staging);
+    list.defer_texture(staging);
+}
+
+pub(crate) fn copy_staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -458,6 +525,34 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
+    let expanded = crate::resource::title_format(resource) == Some(crate::resource::R4G4_UNORM);
+    if expanded
+        && (total == u64::MAX
+            || !layout.addressable()
+            || footprints
+                .iter()
+                .zip(&rows)
+                .enumerate()
+                .any(|(i, (placed, &lines))| {
+                    let f = placed.Footprint;
+                    let m = &layout.mips[i % layout.mips.len()];
+                    f.Width != m.width
+                        || f.Height != m.height
+                        || f.Depth != 1
+                        || lines != m.height
+                        || f.Format.0 != crate::resource::R4G4_HOST_FORMAT as i32
+                        || u64::from(f.RowPitch) < 2 * u64::from(m.width)
+                        || placed
+                            .Offset
+                            .checked_add(
+                                u64::from(f.RowPitch) * u64::from(lines - 1)
+                                    + 2 * u64::from(m.width),
+                            )
+                            .is_none_or(|end| end > total)
+                }))
+    {
+        return None;
+    }
     let (buffer, data) = host.upload_buffer(total)?;
     crate::host::name(&buffer, || {
         format!(
@@ -475,11 +570,11 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        expanded,
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         last: Mutex::default(),
     });
-    *held = Some(s.clone());
     Some(s)
 }
 
