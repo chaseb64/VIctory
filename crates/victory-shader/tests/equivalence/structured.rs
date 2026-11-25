@@ -1,7 +1,7 @@
 //! Executes the compiler's lane control flow and lookup tables directly.
-//! The corpus puts uniform scalar work outside masked regions and uses
-//! mask registers only for control flow. No numeric EXEC or VCC result is
-//! reconstructed from other lanes.
+//! Numeric loop counters are local to their counted loops. Saved masks only
+//! affect control flow. No numeric EXEC or VCC result is reconstructed from
+//! other lanes.
 
 use std::collections::{HashMap, HashSet};
 
@@ -23,7 +23,7 @@ impl Read {
     fn operand(inst: &Inst, op: Operand, vector: bool) -> Result<Self, Stop> {
         match op {
             Operand::Scalar {
-                code: code @ 1..=2,
+                code: code @ (1..=2 | 5),
                 dwords: 1,
             } => Ok(Self::Value(read(inst, Reg::S(code))?)),
             Operand::Vector {
@@ -81,7 +81,7 @@ impl Step {
                 (
                     "s_mov_b32",
                     Some(Operand::Scalar {
-                        code: code @ 1..=2,
+                        code: code @ (1..=2 | 5),
                         dwords: 1,
                     }),
                     &[src],
@@ -89,7 +89,7 @@ impl Step {
                 (
                     "s_add_u32",
                     Some(Operand::Scalar {
-                        code: code @ 1..=2,
+                        code: code @ (1..=2 | 5),
                         dwords: 1,
                     }),
                     &[a, b],
@@ -98,14 +98,19 @@ impl Step {
                 (
                     "s_mov_b32",
                     Some(Operand::Scalar {
-                        code: 3 | 4 | EXEC,
+                        code: 3 | 4 | 6 | 9 | 12 | EXEC,
                         dwords: 1,
                     }),
                     &[src],
                 )
-                | ("s_and_saveexec_b32", Some(Operand::Scalar { code: 3, dwords: 1 }), &[src])
-                    if mask_operand(src) =>
-                {
+                | (
+                    "s_and_saveexec_b32",
+                    Some(Operand::Scalar {
+                        code: 3 | 6 | 9 | 12,
+                        dwords: 1,
+                    }),
+                    &[src],
+                ) if mask_operand(src) => {
                     // Uses resolve these writes through the structured mask expressions.
                     Ok(Self::Symbolic)
                 }
@@ -133,7 +138,7 @@ impl Step {
                 name,
             ) => {
                 if let (
-                    "v_cmp_lt_u32",
+                    cmp @ ("v_cmp_lt_u32" | "v_cmp_gt_u32"),
                     Some(Operand::Scalar {
                         code: VCC,
                         dwords: 1,
@@ -141,14 +146,19 @@ impl Step {
                     &[a, b],
                 ) = (name, dst, src.as_slice())
                 {
-                    return Ok(Self::Compare(scalar(VCC)?, v(a)?, v(b)?));
+                    let (left, right) = if cmp == "v_cmp_lt_u32" {
+                        (a, b)
+                    } else {
+                        (b, a)
+                    };
+                    return Ok(Self::Compare(scalar(VCC)?, v(left)?, v(right)?));
                 }
                 let Some(Operand::Vector { reg, dwords: 1 }) = *dst else {
                     return Err(unsupported());
                 };
                 let (alu, observer) = match (name, reg, src.as_slice()) {
                     ("v_mov_b32", 0, &[src]) => (Alu::Move(v(src)?), false),
-                    ("v_add_nc_u32", 0, &[a, b]) => (Alu::Add(v(a)?, v(b)?), false),
+                    ("v_add_nc_u32", 0..=1, &[a, b]) => (Alu::Add(v(a)?, v(b)?), false),
                     ("v_xor_b32", 0, &[a, b]) => (Alu::Xor(v(a)?, v(b)?), false),
                     ("v_mov_b32", 2, &[src @ Operand::Vector { reg: 0, dwords: 1 }]) => {
                         (Alu::Move(v(src)?), true)
@@ -171,7 +181,7 @@ fn mask_operand(op: Operand) -> bool {
     matches!(
         op,
         Operand::Scalar {
-            code: 0 | 3 | 4 | VCC | EXEC,
+            code: 0 | 3 | 4 | 6 | 9 | 12 | VCC | EXEC,
             dwords: 1,
         } | Operand::Const(128..=208)
             | Operand::Literal(_)
@@ -347,7 +357,7 @@ impl Lane<'_> {
                     .ok_or(Stop::Unsupported("structured phi incoming mask"))?;
                 bits.push((Atom::Phi(phi.value), self.boolean(mask)?));
             }
-            if matches!(phi.reg, Reg::S(1..=2) | Reg::Scc | Reg::V(0..=1)) {
+            if matches!(phi.reg, Reg::S(1..=2 | 5) | Reg::Scc | Reg::V(0..=1)) {
                 values.push((phi.value, self.value(arg)?));
             }
         }

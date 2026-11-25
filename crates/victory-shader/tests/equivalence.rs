@@ -34,7 +34,7 @@ impl Inputs {
         match reg {
             S(0) => Ok(self.mask),
             S(1) => Ok(self.selector),
-            S(2..=4) | S(ir::VCC) | Scc => Ok(0),
+            S(2..=12) | S(ir::VCC) | Scc => Ok(0),
             S(ir::EXEC) => Ok(u32::MAX),
             _ => Err(Stop::Invalid("unexpected scalar input")),
         }
@@ -189,7 +189,7 @@ fn inactive_lanes_restore_and_divergent_exits() {
                 Region::Masked {
                     mask: Mask::Input,
                     skip,
-                    body: vec![Alu::Set(17)],
+                    body: vec![Region::Plain(Alu::Set(17))],
                 },
                 Region::Plain(Alu::Add(2)),
             ];
@@ -211,7 +211,7 @@ fn joined_mask_uses_incoming_edge() {
     let body = [Region::Masked {
         mask: Mask::Joined(7),
         skip: false,
-        body: vec![Alu::Add(4)],
+        body: vec![Region::Plain(Alu::Add(4))],
     }];
     let p = ir::build(&source::encode(&source::program(&body)).unwrap(), false, 3).unwrap();
     let s = structure::structure(&p).unwrap();
@@ -280,7 +280,7 @@ fn wrong_backedge_and_inactive_write_change_results() {
     let body = [Region::Masked {
         mask: Mask::Input,
         skip: false,
-        body: vec![Alu::Set(17)],
+        body: vec![Region::Plain(Alu::Set(17))],
     }];
     let ops = source::program(&body);
     let mut p = ir::build(&source::encode(&ops).unwrap(), false, 3).unwrap();
@@ -333,7 +333,7 @@ fn inverted_lane_exit_is_observable() {
     let body = [Region::Masked {
         mask: Mask::Compare(5),
         skip: true,
-        body: vec![Alu::Set(17)],
+        body: vec![Region::Plain(Alu::Set(17))],
     }];
     let broken = evaluate(&body, &fixture(), |_, s| {
         let exit = s
@@ -373,7 +373,7 @@ fn mask_changes_between_loop_iterations() {
             Region::Masked {
                 mask: Mask::Compare(7),
                 skip: true,
-                body: vec![Alu::Set(0)],
+                body: vec![Region::Plain(Alu::Set(0))],
             },
             Region::Plain(Alu::Add(5)),
         ],
@@ -432,4 +432,178 @@ fn bounded_execution_and_compiler_refusal() {
         failure("build", error),
         Outcome::Refused("build", 0, _)
     ));
+}
+
+#[test]
+fn nested_exec_restores_parent_before_sibling() {
+    for (mask, active) in [
+        (0, &[][..]),
+        (5, &[0, 2][..]),
+        (0x8000_0005, &[0, 2, 31][..]),
+    ] {
+        for outer_skip in [true, false] {
+            for inner_skip in [true, false] {
+                let mut i = fixture();
+                i.mask = mask;
+                let body = [
+                    Region::Masked {
+                        mask: Mask::Input,
+                        skip: outer_skip,
+                        body: vec![
+                            Region::Masked {
+                                mask: Mask::Compare(2),
+                                skip: inner_skip,
+                                body: vec![Region::Plain(Alu::Set(40))],
+                            },
+                            Region::Plain(Alu::Add(4)),
+                        ],
+                    },
+                    Region::Plain(Alu::Add(1)),
+                ];
+                let expected = std::array::from_fn(|l| {
+                    if active.contains(&l) {
+                        if l == 31 { 45 } else { l as u32 + 5 }
+                    } else {
+                        l as u32 + 1
+                    }
+                });
+                hand(&body, &i, expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_loops_carry_two_dependent_vectors() {
+    let body = [Region::Repeat {
+        times: 2,
+        body: vec![
+            Region::Repeat {
+                times: 2,
+                body: vec![Region::Plain(Alu::UpdateData)],
+            },
+            Region::Plain(Alu::AddData),
+        ],
+    }];
+    // (x,3) -> (3x+3,2x+3) -> (11x+12,8x+9).
+    hand(
+        &body,
+        &fixture(),
+        std::array::from_fn(|l| 11 * l as u32 + 12),
+    );
+}
+
+#[test]
+fn divergent_loop_retires_lanes_on_different_trips() {
+    let mut i = fixture();
+    i.v[0] = std::array::from_fn(|l| [0, 1, 3, 4][l % 4]);
+    let body = [Region::AdvanceTo(3), Region::Plain(Alu::AddData)];
+    // At exit v0 is [3,3,3,4]. v1 collected the old active v0 on each trip.
+    hand(&body, &i, std::array::from_fn(|l| [9, 9, 6, 7][l % 4]));
+}
+
+#[test]
+fn losing_second_live_phi_changes_the_observation() {
+    let body = [Region::Repeat {
+        times: 2,
+        body: vec![Region::Plain(Alu::UpdateData), Region::Plain(Alu::AddData)],
+    }];
+    let i = fixture();
+    let ops = source::program(&body);
+    let mut p = ir::build(&source::encode(&ops).unwrap(), false, 3).unwrap();
+    let header = p
+        .blocks
+        .iter_mut()
+        .find(|b| {
+            [0, 1]
+                .iter()
+                .all(|r| b.phis.iter().any(|phi| phi.reg == ir::Reg::V(*r)))
+        })
+        .unwrap();
+    let entry = header.preds.iter().position(|&b| b == 0).unwrap();
+    assert_eq!(header.preds.len(), 2);
+    let phi = header
+        .phis
+        .iter_mut()
+        .find(|p| p.reg == ir::Reg::V(1))
+        .unwrap();
+    phi.args[1 - entry] = phi.args[entry];
+    // For initial (1,3): (5,4) -> (14,9). Resetting v1 gives (13,8).
+    assert_eq!(
+        compare(
+            "ssa",
+            &source::direct(&ops, &i).unwrap(),
+            ssa::execute(&p, &i).unwrap()
+        ),
+        Outcome::Difference {
+            stage: "ssa",
+            lane: 1,
+            expected: 14,
+            actual: 13
+        }
+    );
+    assert_eq!(evaluate(&body, &i, unchanged).outcome, Outcome::Agree);
+}
+
+#[test]
+fn premature_divergent_exit_skips_accumulation() {
+    let body = [Region::AdvanceTo(3), Region::Plain(Alu::AddData)];
+    let i = fixture();
+    let result = evaluate(&body, &i, |p, s| {
+        let check = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.iter().any(|i| i.name() == "s_cbranch_execz"))
+            .unwrap();
+        let structure::LaneExit::Branch { when, .. } = &mut s.exits[check] else {
+            panic!("expected a conditional lane exit")
+        };
+        *when = structure::Bool::TRUE;
+    });
+    assert_eq!(
+        result.outcome,
+        Outcome::Difference {
+            stage: "structured",
+            lane: 0,
+            expected: 9,
+            actual: 3
+        }
+    );
+    assert_eq!(evaluate(&body, &i, unchanged).outcome, Outcome::Agree);
+}
+
+#[test]
+fn a_lane_reenters_the_inner_mask_on_the_next_outer_trip() {
+    use Region::{AdvanceTo, Masked, Plain, Repeat};
+    let mut i = fixture();
+    i.mask = 0x7777_7777;
+    i.v[0] = std::array::from_fn(|lane| [0, 2, 3, 4][lane % 4]);
+    let body = [
+        Repeat {
+            times: 2,
+            body: vec![
+                Masked {
+                    mask: Mask::Input,
+                    skip: true,
+                    body: vec![
+                        Masked {
+                            mask: Mask::Compare(0),
+                            skip: true,
+                            body: vec![AdvanceTo(3)],
+                        },
+                        Plain(Alu::UpdateData),
+                    ],
+                },
+                Plain(Alu::Add(1)),
+            ],
+        },
+        Plain(Alu::AddData),
+    ];
+    // At the end of the two trips the four (v0,v1) pairs are
+    // (4,9), (5,12), (5,10), (6,3). Lane 0 entered only on trip two.
+    hand(
+        &body,
+        &i,
+        std::array::from_fn(|lane| [13, 17, 15, 9][lane % 4]),
+    );
 }

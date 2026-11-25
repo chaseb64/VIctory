@@ -4,15 +4,16 @@ use super::{Inputs, LIMIT, Stop};
 
 const EXEC: u8 = 126;
 const VCC: u8 = 106;
-const SAVE: u8 = 3;
+const FIRST_SAVE: u8 = 3;
 const MASK: u8 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Alu {
-    Add(u8), // v0 += inline constant
-    XorData, // v0 ^= v1
-    AddData, // v0 += v1
-    Set(u8), // v0 = inline constant
+    Add(u8),    // v0 += inline constant
+    XorData,    // v0 ^= v1
+    AddData,    // v0 += v1
+    UpdateData, // v1 += v0
+    Set(u8),    // v0 = inline constant
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,8 +33,9 @@ pub(super) enum Region {
     Masked {
         mask: Mask,
         skip: bool,
-        body: Vec<Alu>,
+        body: Vec<Region>,
     },
+    AdvanceTo(u8), // while v0 < limit: v1 += v0, v0 += 1
     Repeat {
         times: u8,
         body: Vec<Region>,
@@ -50,11 +52,12 @@ use Src::{Imm, S};
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Op {
     Mov(u8, Src),
-    Inc,
+    Inc(u8),
     Less(u8, u8),
     Vector(Alu),
     Compare(u8),
-    Narrow(u8),
+    Below(u8),
+    Narrow { save: u8, mask: u8 },
     Scc1(usize),
     ExecZ(usize),
     Jump(usize),
@@ -63,7 +66,7 @@ pub(super) enum Op {
 }
 use Op::*;
 
-fn regions(body: &[Region], ops: &mut Vec<Op>) {
+fn regions(body: &[Region], ops: &mut Vec<Op>, counter: u8, save: u8) {
     for region in body {
         match region {
             Region::Plain(a) => ops.push(Vector(*a)),
@@ -97,19 +100,40 @@ fn regions(body: &[Region], ops: &mut Vec<Op>) {
                         MASK
                     }
                 };
-                ops.push(Narrow(source));
+                ops.push(Narrow { save, mask: source });
+                let branch = ops.len();
                 if *skip {
-                    ops.push(ExecZ(ops.len() + 1 + body.len()));
+                    ops.push(ExecZ(0));
                 }
-                ops.extend(body.iter().copied().map(Vector));
-                ops.push(Mov(EXEC, S(SAVE)));
+                regions(body, ops, counter, save + 3);
+                if *skip {
+                    ops[branch] = ExecZ(ops.len());
+                }
+                ops.push(Mov(EXEC, S(save)));
+            }
+            Region::AdvanceTo(limit) => {
+                // Save the enclosing mask once. Each trip permanently retires
+                // the lanes that have reached the limit, until reconvergence.
+                ops.push(Mov(save, S(EXEC)));
+                let header = ops.len();
+                ops.extend([
+                    Below(*limit),
+                    Narrow {
+                        save: save + 3,
+                        mask: VCC,
+                    },
+                    ExecZ(header + 6),
+                    Vector(Alu::UpdateData),
+                    Vector(Alu::Add(1)),
+                    Jump(header),
+                    Mov(EXEC, S(save)),
+                ]);
             }
             Region::Repeat { times, body } => {
-                // Generator uses one loop level and a positive trip count.
-                ops.push(Mov(2, Imm(0)));
+                ops.push(Mov(counter, Imm(0)));
                 let header = ops.len();
-                regions(body, ops);
-                ops.extend([Inc, Less(2, *times), Scc1(header)]);
+                regions(body, ops, counter + 3, save);
+                ops.extend([Inc(counter), Less(counter, *times), Scc1(header)]);
             }
         }
     }
@@ -117,7 +141,7 @@ fn regions(body: &[Region], ops: &mut Vec<Op>) {
 
 pub(super) fn program(body: &[Region]) -> Vec<Op> {
     let mut ops = Vec::new();
-    regions(body, &mut ops);
+    regions(body, &mut ops, 2, FIRST_SAVE);
     ops.extend([Observe, End]);
     ops
 }
@@ -144,14 +168,16 @@ pub(super) fn encode(ops: &[Op]) -> Result<Vec<u8>, Stop> {
         };
         let word = match *op {
             Mov(r, src) => 0xbe80_0300 | u32::from(r) << 16 | src.bits(),
-            Inc => 0x8002_8102, // s_add_u32 s2,s2,1
+            Inc(r) => 0x8000_8100 | u32::from(r) << 16 | u32::from(r),
             Less(r, k) => 0xbf0a_0000 | Imm(k).bits() << 8 | u32::from(r),
             Vector(Alu::Add(k)) => (0x25 << 25) | Imm(k).bits(),
             Vector(Alu::AddData) => (0x25 << 25) | 257,
+            Vector(Alu::UpdateData) => (0x25 << 25) | (1 << 17) | (1 << 9) | 256,
             Vector(Alu::XorData) => (0x1d << 25) | 257,
             Vector(Alu::Set(k)) => 0x7e00_0200 | Imm(k).bits(),
             Compare(k) => 0x7d82_0000 | Imm(k).bits(),
-            Narrow(r) => 0xbe83_3c00 | u32::from(r),
+            Below(k) => 0x7d88_0000 | Imm(k).bits(),
+            Narrow { save, mask } => 0xbe80_3c00 | u32::from(save) << 16 | u32::from(mask),
             Scc1(t) => branch(0xbf85_0000, t)?,
             ExecZ(t) => branch(0xbf88_0000, t)?,
             Jump(t) => branch(0xbf82_0000, t)?,
@@ -186,32 +212,38 @@ pub(super) fn direct(ops: &[Op], inputs: &Inputs) -> Result<[u32; 32], Stop> {
                     Imm(k) => k.into(),
                 }
             }
-            Inc => (sgpr[2], scc) = sgpr[2].overflowing_add(1),
+            Inc(r) => (sgpr[r as usize], scc) = sgpr[r as usize].overflowing_add(1),
             Less(r, k) => scc = sgpr[r as usize] < k.into(),
-            Compare(k) => {
+            Compare(k) | Below(k) => {
                 let mut mask = 0u32;
                 for (lane, value) in v[0].iter().enumerate() {
-                    if u32::from(k) < *value {
+                    let passes = if matches!(op, Below(_)) {
+                        *value < k.into()
+                    } else {
+                        *value > k.into()
+                    };
+                    if passes {
                         mask |= 1 << lane;
                     }
                 }
                 sgpr[VCC as usize] = mask & exec;
             }
-            Narrow(r) => {
-                let narrowed = exec & sgpr[r as usize];
-                sgpr[SAVE as usize] = exec;
+            Narrow { save, mask } => {
+                let narrowed = exec & sgpr[mask as usize];
+                sgpr[save as usize] = exec;
                 sgpr[EXEC as usize] = narrowed;
                 scc = narrowed != 0;
             }
             Vector(a) => {
                 let [accumulator, data, _] = &mut v;
-                for (lane, (x, &y)) in accumulator.iter_mut().zip(data.iter()).enumerate() {
+                for (lane, (x, y)) in accumulator.iter_mut().zip(data.iter_mut()).enumerate() {
                     if exec & (1 << lane) != 0 {
-                        *x = match a {
-                            Alu::Add(k) => x.wrapping_add(k.into()),
-                            Alu::AddData => x.wrapping_add(y),
-                            Alu::XorData => *x ^ y,
-                            Alu::Set(k) => k.into(),
+                        match a {
+                            Alu::Add(k) => *x = x.wrapping_add(k.into()),
+                            Alu::AddData => *x = x.wrapping_add(*y),
+                            Alu::UpdateData => *y = y.wrapping_add(*x),
+                            Alu::XorData => *x ^= *y,
+                            Alu::Set(k) => *x = k.into(),
                         };
                     }
                 }

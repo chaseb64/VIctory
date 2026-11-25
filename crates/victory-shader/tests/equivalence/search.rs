@@ -39,7 +39,9 @@ impl Random {
                 Region::Masked {
                     mask,
                     skip: self.small(2) == 1,
-                    body: (0..1 + self.small(4)).map(|_| self.alu()).collect(),
+                    body: (0..1 + self.small(4))
+                        .map(|_| Region::Plain(self.alu()))
+                        .collect(),
                 }
             }
             _ => Region::Repeat {
@@ -76,6 +78,87 @@ fn generate(seed: u64) -> (Vec<Region>, Inputs) {
     )
 }
 
+// Select a shape by seed so any consecutive group of four covers each
+// interaction. Keep the original generator and its seeds stable.
+fn targeted(seed: u64) -> (Vec<Region>, Inputs) {
+    use Region::{AdvanceTo, Masked, Plain, Repeat};
+    let mut r = Random(seed);
+    let mask = match r.small(6) {
+        0 => 0,
+        1 => u32::MAX,
+        2 => 1u32 << r.small(32),
+        3 => 0x5555_5555,
+        _ => r.word(),
+    };
+    let i = Inputs {
+        mask,
+        selector: r.small(2).into(),
+        v: [
+            std::array::from_fn(|_| {
+                if r.small(8) == 0 {
+                    u32::MAX
+                } else {
+                    r.small(10).into()
+                }
+            }),
+            std::array::from_fn(|_| r.word()),
+            std::array::from_fn(|_| r.word()),
+        ],
+    };
+    let trips = 1 + r.small(3);
+    let limit = 1 + r.small(8);
+    let inner = Masked {
+        mask: Mask::Compare(r.small(10)),
+        skip: r.small(2) == 1,
+        body: vec![Plain(Alu::UpdateData)],
+    };
+    let outer_skip = r.small(2) == 1;
+    let region = match seed % 4 {
+        0 => Masked {
+            mask: Mask::Joined(r.small(10)),
+            skip: outer_skip,
+            body: vec![inner, Plain(Alu::AddData)],
+        },
+        1 => Repeat {
+            times: trips,
+            body: vec![
+                Repeat {
+                    times: 1 + r.small(3),
+                    body: vec![inner, Plain(Alu::AddData)],
+                },
+                Plain(Alu::UpdateData),
+            ],
+        },
+        2 => Masked {
+            mask: Mask::Input,
+            skip: outer_skip,
+            body: vec![AdvanceTo(limit), Plain(Alu::UpdateData)],
+        },
+        _ => Repeat {
+            times: trips,
+            body: vec![
+                Masked {
+                    mask: Mask::Input,
+                    skip: outer_skip,
+                    body: vec![
+                        Masked {
+                            mask: Mask::Joined(r.small(7)),
+                            skip: r.small(2) == 1,
+                            body: vec![AdvanceTo(limit)],
+                        },
+                        Plain(Alu::UpdateData),
+                    ],
+                },
+                Region::If {
+                    yes: Alu::Set(r.small(7)),
+                    no: Alu::XorData,
+                },
+            ],
+        },
+    };
+    (vec![region, Plain(Alu::AddData)], i)
+}
+
 #[test]
 fn fixed_generated_corpus_agrees() {
     // This range was independently validated on Windows during PR review.
@@ -85,6 +168,18 @@ fn fixed_generated_corpus_agrees() {
             evaluate(&body, &inputs, unchanged).outcome,
             Outcome::Agree,
             "generated Wave32 program at seed {seed}"
+        );
+    }
+}
+
+#[test]
+fn fixed_targeted_corpus_agrees() {
+    for seed in 10_000..10_128 {
+        let (body, inputs) = targeted(seed);
+        assert_eq!(
+            evaluate(&body, &inputs, unchanged).outcome,
+            Outcome::Agree,
+            "targeted Wave32 program at seed {seed}"
         );
     }
 }
@@ -120,10 +215,8 @@ fn smaller(body: &[Region]) -> Vec<Vec<Region>> {
                 mask,
                 skip,
                 body: inner,
-            } if inner.len() > 1 => {
-                for k in 0..inner.len() {
-                    let mut shorter = inner.clone();
-                    shorter.remove(k);
+            } => {
+                for shorter in smaller(inner).into_iter().filter(|v| !v.is_empty()) {
                     let mut v = body.to_vec();
                     v[i] = Region::Masked {
                         mask: *mask,
@@ -132,6 +225,11 @@ fn smaller(body: &[Region]) -> Vec<Vec<Region>> {
                     };
                     candidates.push(v);
                 }
+            }
+            Region::AdvanceTo(k) if *k > 0 => {
+                let mut v = body.to_vec();
+                v[i] = Region::AdvanceTo(k - 1);
+                candidates.push(v);
             }
             _ => {}
         }
@@ -156,7 +254,7 @@ fn reducer_retains_the_guard_disagreement() {
     let active = Region::Masked {
         mask: Mask::Input,
         skip: false,
-        body: vec![Alu::Add(0), Alu::Set(17)],
+        body: vec![Region::Plain(Alu::Add(0)), Region::Plain(Alu::Set(17))],
     };
     let body = [
         Region::Plain(Alu::Add(0)),
@@ -188,11 +286,58 @@ fn reducer_retains_the_guard_disagreement() {
         vec![Region::Masked {
             mask: Mask::Input,
             skip: false,
-            body: vec![Alu::Set(17)]
+            body: vec![Region::Plain(Alu::Set(17))]
         }]
     );
     assert_eq!(source::program(&body).len(), 8);
     assert_eq!(source::program(&reduced).len(), 5);
+    assert_eq!(evaluate(&reduced, &i, fault).outcome, wanted);
+    assert_eq!(evaluate(&reduced, &i, unchanged).outcome, Outcome::Agree);
+}
+
+#[test]
+fn reducer_preserves_a_wrong_nested_restore_guard() {
+    use Region::{Masked, Plain};
+    let nested = |inner| Masked {
+        mask: Mask::Input,
+        skip: false,
+        body: vec![
+            Masked {
+                mask: Mask::Compare(5),
+                skip: false,
+                body: inner,
+            },
+            Plain(Alu::Add(1)),
+        ],
+    };
+    let body = [
+        Plain(Alu::Add(0)),
+        nested(vec![Plain(Alu::Add(0)), Plain(Alu::Set(17))]),
+    ];
+    // Use the inner guard again on the sibling add. Correctly restored
+    // parent lanes 0 and 2 should execute it even though they failed the compare.
+    let fault: Perturb = |p, s| {
+        for (b, guards) in p.blocks.iter().zip(&mut s.guards) {
+            let mut inner = None;
+            for (i, g) in b.insts.iter().zip(guards) {
+                if i.name() == "v_mov_b32" && i.write(ir::Reg::V(0)).is_some() {
+                    inner = *g;
+                } else if i.name() == "v_add_nc_u32" && inner.is_some() && g.is_some() {
+                    *g = inner;
+                }
+            }
+        }
+    };
+    let i = fixture();
+    let wanted = Outcome::Difference {
+        stage: "structured",
+        lane: 0,
+        expected: 1,
+        actual: 0,
+    };
+    assert_eq!(evaluate(&body, &i, fault).outcome, wanted);
+    let reduced = reduce(&body, &i, &wanted, fault);
+    assert_eq!(reduced, [nested(vec![Plain(Alu::Set(17))])]);
     assert_eq!(evaluate(&reduced, &i, fault).outcome, wanted);
     assert_eq!(evaluate(&reduced, &i, unchanged).outcome, Outcome::Agree);
 }
@@ -266,6 +411,16 @@ fn option(name: &str, default: u64) -> u64 {
 #[test]
 #[ignore = "bounded generated campaign; use WAVE_SEED and WAVE_COUNT for replay"]
 fn campaign() {
+    run_campaign(generate, false);
+}
+
+#[test]
+#[ignore = "bounded nested control-flow campaign"]
+fn targeted_campaign() {
+    run_campaign(targeted, true);
+}
+
+fn run_campaign(generator: fn(u64) -> (Vec<Region>, Inputs), require_all: bool) {
     let start = Instant::now();
     let first = option("WAVE_SEED", 0);
     let count = option("WAVE_COUNT", 10_000).min(10_000);
@@ -275,7 +430,7 @@ fn campaign() {
             break;
         }
         let seed = first.wrapping_add(n);
-        let (body, i) = generate(seed);
+        let (body, i) = generator(seed);
         let result = evaluate(&body, &i, unchanged);
         totals.record(&result);
         if result.outcome != Outcome::Agree {
@@ -287,13 +442,15 @@ fn campaign() {
                 );
             }
         }
-        if matches!(
-            result.outcome,
-            Outcome::Difference { .. }
-                | Outcome::Crash(..)
-                | Outcome::CompilerError(..)
-                | Outcome::Stop(_, Stop::Invalid(_))
-        ) {
+        if (require_all && result.outcome != Outcome::Agree)
+            || matches!(
+                result.outcome,
+                Outcome::Difference { .. }
+                    | Outcome::Crash(..)
+                    | Outcome::CompilerError(..)
+                    | Outcome::Stop(_, Stop::Invalid(_))
+            )
+        {
             break; // inspect the first candidate before spending the remaining budget
         }
     }
@@ -309,4 +466,10 @@ fn campaign() {
         totals.both_agreed > 0,
         "no completed structured comparisons"
     );
+    if require_all {
+        assert_eq!(
+            totals.both_agreed as u64, count,
+            "incomplete targeted campaign"
+        );
+    }
 }

@@ -178,12 +178,17 @@ fn vector_effects(reads: &mut Reads<'_>, writes: &mut Vec<(Reg, Data)>) -> Resul
     let dst = dst.ok_or(Stop::Invalid("missing SSA vector instruction destination"))?;
     let exec = reads.scalar(EXEC)?;
     let (reg, data) = match (reads.inst.name(), src.as_slice()) {
-        ("v_cmp_lt_u32", [left, right]) => {
+        (name @ ("v_cmp_lt_u32" | "v_cmp_gt_u32"), [left, right]) => {
             let left = reads.vector_operand(*left)?;
             let right = reads.vector_operand(*right)?;
             let mut mask = 0;
             for lane in 0..32 {
-                if exec & (1 << lane) != 0 && left[lane] < right[lane] {
+                let passes = if name == "v_cmp_lt_u32" {
+                    left[lane] < right[lane]
+                } else {
+                    left[lane] > right[lane]
+                };
+                if exec & (1 << lane) != 0 && passes {
                     mask |= 1 << lane;
                 }
             }
@@ -231,7 +236,7 @@ fn execute_inst(values: &mut Values, inst: &Inst) -> Result<Control, Stop> {
             scalar_effects(&mut reads, &mut writes)?;
             Control::Next
         }
-        "v_cmp_lt_u32" | "v_mov_b32" | "v_add_nc_u32" | "v_xor_b32" => {
+        "v_cmp_lt_u32" | "v_cmp_gt_u32" | "v_mov_b32" | "v_add_nc_u32" | "v_xor_b32" => {
             vector_effects(&mut reads, &mut writes)?;
             Control::Next
         }
