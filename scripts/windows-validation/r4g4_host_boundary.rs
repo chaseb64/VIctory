@@ -32,7 +32,8 @@ mod windows_validation_r4g4 {
             "D3D12 device must use the enumerated WARP adapter"
         );
         assert_ne!(adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
-        assert!(host.log_messages().is_none(), "D3D12 startup validation error");
+        let startup = host.log_messages();
+        assert!(startup.is_none(), "D3D12 startup validation error: {startup:?}");
         eprintln!(
             "VICTORY_ORACLE_WARP debug=active vendor={:04x} device={:04x} luid={:08x}:{:08x} name={}",
             adapter.VendorId,

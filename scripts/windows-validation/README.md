@@ -12,4 +12,6 @@ Run locally from a native x64 Windows checkout with PowerShell 7 and the reposit
 ./scripts/windows-validation/run.ps1 -Suite R4G4 -Adapter Physical -OutputDirectory "$env:TEMP/victory-hardware"
 ```
 
+The pre-existing FMAD startup probe declares both directly indexed descriptor heaps. The runner temporarily binds its missing sampler heap in both test checkouts, keeping the debug layer active through startup and the scenario under test. The production commit and R4G4 test source retain their exact contents.
+
 The hardware mode runs the shader test on the physical adapter selected by VIctory. The WARP mode also checks adapter LUID identity and runs the matched baseline and candidate oracle. Both modes require a live device and an active debug layer. The logs record adapter and driver information. Generated logs, executables and game assets stay outside the checked-in validation tree.

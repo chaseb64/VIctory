@@ -100,45 +100,54 @@ namespace VictoryValidation {
     }
 
     $gpu = 'resource::tests::r4g4_gpu_test::sampled_r4g4_gpu_upload_copy_and_sample'
-    $gpuCode = Invoke-Logged 'candidate-d3d12' {
-        cargo test --locked -j 2 -p victory-gpu --features diagnostics $gpu -- --exact --ignored --nocapture --test-threads=1
-    }
+    $oracle = 'resource::windows_validation_r4g4::shared_r4g4_host_boundary'
+    $overlay = Join-Path $PSScriptRoot 'r4g4_host_boundary.rs'
+    $startupPatch = Join-Path $PSScriptRoot 'fmad-probe.patch.txt'
+    Get-FileHash $startupPatch | Format-List | Out-File (Join-Path $OutputDirectory 'startup-patch.sha256.txt')
+    $revisions = @(@{ Name='candidate'; Ref='HEAD' })
+    if ($Adapter -eq 'WARP') { $revisions += @{ Name='parent'; Ref=$Baseline } }
 
-    if ($Adapter -eq 'WARP') {
-        $oracle = 'resource::windows_validation_r4g4::shared_r4g4_host_boundary'
-        $overlay = Join-Path $PSScriptRoot 'r4g4_host_boundary.rs'
-        $worktrees = @()
+    foreach ($revision in $revisions) {
+        $tree = Join-Path ([System.IO.Path]::GetTempPath()) ("victory-" + [guid]::NewGuid())
+        git worktree add --detach $tree $revision.Ref
+        Assert-Passed 'Create temporary worktree' $LASTEXITCODE
+        Push-Location $tree
         try {
-            foreach ($revision in @(@{ Name='parent'; Ref=$Baseline }, @{ Name='candidate'; Ref='HEAD' })) {
-                $tree = Join-Path ([System.IO.Path]::GetTempPath()) ("victory-" + [guid]::NewGuid())
-                git worktree add --detach $tree $revision.Ref
-                Assert-Passed 'Create temporary worktree' $LASTEXITCODE
-                $worktrees += $tree
-                Push-Location $tree
-                try {
-                    $env:CARGO_TARGET_DIR = Join-Path $root 'target'
-                    Add-Content 'crates/victory-gpu/src/resource.rs' ("`n" + (Get-Content -Raw $overlay))
-                    $name = "$($revision.Name)-host-boundary"
-                    git rev-parse HEAD | Set-Content (Join-Path $OutputDirectory "$name.revision.txt")
-                    $code = Invoke-Logged $name {
-                        cargo test --locked -j 2 -p victory-gpu --features diagnostics $oracle -- --exact --ignored --nocapture --test-threads=1
+            $env:CARGO_TARGET_DIR = Join-Path $root "target/validation-$($revision.Name)"
+            $name = "$($revision.Name)-host-boundary"
+            git rev-parse HEAD | Set-Content (Join-Path $OutputDirectory "$name.revision.txt")
+            Assert-Passed 'Apply shared startup probe correction' (Invoke-Logged "$($revision.Name)-startup-patch" {
+                git apply --check --verbose $startupPatch
+                if ($LASTEXITCODE -eq 0) { git apply --verbose $startupPatch }
+                if ($LASTEXITCODE -eq 0) { git diff --stat }
+            })
+
+            if ($revision.Name -eq 'candidate') {
+                $gpuCode = Invoke-Logged 'candidate-d3d12' {
+                    cargo test --locked -j 2 -p victory-gpu --features diagnostics $gpu -- --exact --ignored --nocapture --test-threads=1
+                }
+            }
+            if ($Adapter -eq 'WARP') {
+                Add-Content 'crates/victory-gpu/src/resource.rs' ("`n" + (Get-Content -Raw $overlay))
+                $code = Invoke-Logged $name {
+                    cargo test --locked -j 2 -p victory-gpu --features diagnostics $oracle -- --exact --ignored --nocapture --test-threads=1
+                }
+                if ($revision.Name -eq 'parent') {
+                    $log = Get-Content -Raw (Join-Path $OutputDirectory "$name.log")
+                    if ($code -ne 101 -or $log -notmatch 'VICTORY_ORACLE_WARP debug=active' -or
+                        $log -notmatch 'VICTORY_ORACLE_RG8_CONTROL guest=49 host=49' -or
+                        $log -notmatch 'VICTORY_ORACLE_R4G4 guest=190 host=(absent|190)' -or
+                        $log -notmatch 'R4G4 must have an RG8 host image') {
+                        throw 'The baseline did not fail at the expected R4G4 host format assertion'
                     }
-                    if ($revision.Name -eq 'parent') {
-                        $log = Get-Content -Raw (Join-Path $OutputDirectory "$name.log")
-                        if ($code -ne 101 -or $log -notmatch 'VICTORY_ORACLE_WARP debug=active' -or
-                            $log -notmatch 'VICTORY_ORACLE_RG8_CONTROL guest=49 host=49' -or
-                            $log -notmatch 'VICTORY_ORACLE_R4G4 guest=190 host=(absent|190)' -or
-                            $log -notmatch 'R4G4 must have an RG8 host image') {
-                            throw 'The baseline did not fail at the expected R4G4 host format assertion'
-                        }
-                    } else {
-                        Assert-Passed $name $code
-                        Assert-OneTest $name 'VICTORY_ORACLE_R4G4 guest=190 host=49 debug_error=None'
-                    }
-                } finally { Pop-Location }
+                } else {
+                    Assert-Passed $name $code
+                    Assert-OneTest $name 'VICTORY_ORACLE_R4G4 guest=190 host=49 debug_error=None'
+                }
             }
         } finally {
-            foreach ($tree in $worktrees) { git worktree remove --force $tree | Out-Host }
+            Pop-Location
+            git worktree remove --force $tree | Out-Host
         }
     }
 
