@@ -318,14 +318,6 @@ try {
 
     Invoke-WindowsToolchain 'windows-toolchain' $trees.host
     Set-Target 'host'
-    Invoke-WithWarp {
-        Invoke-Check 'r4g4-warp-readback' $trees.host { Invoke-WarpReadback }
-        if ($results['r4g4-warp-readback'].outcome -eq 'failed') {
-            $env:VICTORY_D3D12_DEBUG = $null
-            $env:VICTORY_REQUIRE_D3D12_DEBUG = $null
-            Invoke-Check 'r4g4-warp-readback-no-debug' $trees.host { Invoke-WarpReadback }
-        }
-    }
     Invoke-Workspace 'host'
     Clear-Target
 
@@ -370,6 +362,18 @@ try {
     Clear-Target
 
     Invoke-WithWarp {
+        foreach ($role in 'guest', 'host') {
+            Invoke-Check "fmad-startup-overlay-$role" $trees[$role] {
+                $patch = Join-Path $PSScriptRoot 'fmad-probe.patch.txt'
+                Write-Log "startup_patch_sha256=$((Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash)"
+                Invoke-Logged git @('apply', '--check', '--verbose', $patch)
+                Invoke-Logged git @('apply', '--verbose', $patch)
+                Invoke-Logged git @('diff', '--stat')
+            }
+        }
+        Set-Target 'host-with-fmad-overlay'
+        Invoke-Check 'r4g4-warp-readback' $trees.host { Invoke-WarpReadback }
+        Clear-Target
         Set-Target 'guest-with-r4g4-oracle'
         Invoke-Check 'r4g4-host-baseline' $trees.guest { Invoke-HostBoundaryOracle -ExpectedFailure }
         Invoke-Check 'r4g4-host-baseline-startup-debug' $trees.guest { Require-CleanHostStartup 'r4g4-host-baseline' }

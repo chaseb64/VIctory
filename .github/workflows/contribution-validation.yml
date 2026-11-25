@@ -1,6 +1,8 @@
 name: Windows contribution validation
 
 on:
+  push:
+    branches: [validation/windows-contributions, "validation/windows-contributions/**"]
   workflow_dispatch:
     inputs:
       suite:
@@ -40,7 +42,7 @@ concurrency:
 
 jobs:
   validate:
-    if: ${{ github.event.repository.fork == true && github.event.repository.private == false && github.repository != 'Marvisak/VIctory' }}
+    if: ${{ github.event.repository.fork == true && github.event.repository.private == false && github.repository == 'chaseb64/VIctory' }}
     runs-on: windows-2025
     timeout-minutes: 120
     defaults:
@@ -61,7 +63,7 @@ jobs:
           persist-credentials: false
 
       - name: Probe native WARP capability
-        if: ${{ inputs.suite == 'contributions' }}
+        if: ${{ github.event_name == 'push' || inputs.suite == 'contributions' }}
         timeout-minutes: 10
         run: |
           ./scripts/windows-validation/probe-warp.ps1 `
@@ -71,11 +73,11 @@ jobs:
         if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         timeout-minutes: 105
         env:
-          VALIDATION_SUITE: ${{ inputs.suite }}
-          UPSTREAM_BASE: ${{ inputs.upstream_base }}
-          GUEST_LAYOUT: ${{ inputs.guest_layout }}
-          HOST_CANDIDATE: ${{ inputs.host_candidate }}
-          WAVE_CANDIDATE: ${{ inputs.wave_candidate }}
+          VALIDATION_SUITE: ${{ inputs.suite || 'contributions' }}
+          UPSTREAM_BASE: ${{ inputs.upstream_base || '940d32f69b22265690a0b5a15d6ded572ba33baf' }}
+          GUEST_LAYOUT: ${{ inputs.guest_layout || '5c16c766033e4052f09a446372c47238d8193cf5' }}
+          HOST_CANDIDATE: ${{ inputs.host_candidate || 'f4d71531b5d7fb868ee65b5dd5e7574695e6c980' }}
+          WAVE_CANDIDATE: ${{ inputs.wave_candidate || 'd35bfafadd107c844fa3d76c6ad7b0cbb46333d6' }}
         run: |
           ./scripts/windows-validation/validate.ps1 `
             -Suite $env:VALIDATION_SUITE `
