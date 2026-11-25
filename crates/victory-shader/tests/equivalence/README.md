@@ -72,7 +72,8 @@ data and uniform selector within it.
 The regular tests require seeds 10,000 through 10,127 from each generator to
 complete and agree at both stages. Each opt-in campaign runs at most 10,000
 consecutive seeds or 30 minutes and reports per-stage agreement counts.
-The targeted campaign requires the entire requested range to agree.
+The targeted campaign accepts `WAVE_COUNT` from 1 through 10,000 and requires
+the entire requested range to agree. Other counts fail before the search starts.
 Refusal, unsupported behavior, invalid execution, compiler errors, exhaustion,
 panic and differences are counted separately. A mismatch prints its seed,
 stage, first differing lane, expected and actual dwords and reduced regions.

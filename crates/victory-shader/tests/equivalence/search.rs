@@ -423,9 +423,16 @@ fn targeted_campaign() {
 fn run_campaign(generator: fn(u64) -> (Vec<Region>, Inputs), require_all: bool) {
     let start = Instant::now();
     let first = option("WAVE_SEED", 0);
-    let count = option("WAVE_COUNT", 10_000).min(10_000);
+    const MAX_CASES: u64 = 10_000;
+    let count = option("WAVE_COUNT", MAX_CASES);
+    if require_all {
+        assert!(
+            (1..=MAX_CASES).contains(&count),
+            "targeted WAVE_COUNT must be between 1 and {MAX_CASES}"
+        );
+    }
     let mut totals = Counts::default();
-    for n in 0..count {
+    for n in 0..count.min(MAX_CASES) {
         if start.elapsed() >= Duration::from_secs(1800) {
             break;
         }
