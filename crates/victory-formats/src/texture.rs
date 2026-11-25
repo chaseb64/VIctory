@@ -751,8 +751,8 @@ pub struct Format {
     pub stencil: bool,
 }
 
-/// By DXGI format number. `None` for 96-bit, 1-bit, packed 4:2:2 and video
-/// formats.
+/// By guest DXGI format number, including Xbox extensions. `None` for
+/// 96-bit, 1-bit, packed 4:2:2 and video formats.
 ///
 /// shortcut: those formats have no layout here; add them when a title uses
 /// one.
@@ -767,6 +767,8 @@ pub fn format(dxgi: u32) -> Option<Format> {
         60..=65 => (1, 1, false),
         70..=72 | 79..=81 => (8, 4, false),
         73..=78 | 82..=84 | 94..=99 => (16, 4, false),
+        189 => (4, 1, false), // Xbox R10G10B10_SNORM_A2_UNORM
+        190 => (1, 1, false), // Xbox R4G4_UNORM
         _ => return None,
     };
     Some(Format {
@@ -788,7 +790,7 @@ pub struct TextureDesc {
     pub depth_or_array: u32,
     /// 0: the full chain.
     pub mips: u32,
-    /// DXGI format number.
+    /// Guest DXGI format number.
     pub format: u32,
     pub samples: u32,
     pub swizzle: Swizzle,
@@ -1235,6 +1237,65 @@ mod tests {
         assert_eq!(t.planes[1].offset, t.planes[0].layout.size);
         assert_eq!(t.planes[1].layout.size, 2048 * 1280);
         assert!(!t.planes[0].layout.addressable());
+    }
+
+    #[test]
+    fn xbox_format_189_tiles_and_detiles() {
+        check_xbox_format_copy(189, 16384, 1, &[(10240, 16), (10368, 16), (10752, 4)]);
+    }
+
+    #[test]
+    fn xbox_format_190_tiles_and_detiles() {
+        check_xbox_format_copy(190, 8192, 0, &[(5632, 9)]);
+    }
+
+    fn check_xbox_format_copy(
+        format: u32,
+        size: u64,
+        first_tail_mip: u32,
+        first_row_runs: &[(usize, usize)],
+    ) {
+        let t = Texture::new(&TextureDesc {
+            dimension: Dimension::Tex2d,
+            width: 19,
+            height: 9,
+            depth_or_array: 2,
+            mips: 5,
+            format,
+            samples: 1,
+            swizzle: Swizzle::SW_4KB_S,
+        })
+        .unwrap();
+        assert_eq!((t.size, t.alignment, t.planes.len()), (size, 4096, 1));
+        let layout = &t.planes[0].layout;
+        assert_eq!(layout.first_tail_mip, first_tail_mip);
+
+        // Mesa addrlib (ffb5da1b, Navi 21) gives these byte runs for the
+        // 9x4 mip in slice 1. Each run starts 16 bytes later on the next row.
+        let row_pitch: usize = first_row_runs.iter().map(|&(_, len)| len).sum();
+        let linear: Vec<u8> = (1..=u8::MAX).cycle().take(4 * row_pitch).collect();
+        let mut expected_tiled = vec![0; size as usize];
+        for (y, row) in linear.chunks_exact(row_pitch).enumerate() {
+            let mut row_offset = 0;
+            for &(offset, len) in first_row_runs {
+                let offset = offset + y * 16;
+                expected_tiled[offset..][..len].copy_from_slice(&row[row_offset..][..len]);
+                row_offset += len;
+            }
+        }
+
+        let mut tiled = vec![0; size as usize];
+        layout
+            .tile(&mut tiled, 1, 1, &linear, row_pitch, 0)
+            .unwrap();
+        let first_mismatch = tiled.iter().zip(&expected_tiled).position(|(a, b)| a != b);
+        assert_eq!(first_mismatch, None, "first differing tiled byte offset");
+
+        let mut detiled = vec![0; linear.len()];
+        layout
+            .detile(&expected_tiled, 1, 1, &mut detiled, row_pitch, 0)
+            .unwrap();
+        assert_eq!(detiled, linear);
     }
 
     #[test]
