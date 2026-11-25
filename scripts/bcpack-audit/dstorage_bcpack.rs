@@ -94,7 +94,75 @@ impl Guarded {
     }
 }
 
+#[path = "texture_pairs.rs"]
+mod texture_pairs;
+
+fn deliver(
+    t: &mut Tap,
+    s: &Storage,
+    array: Com,
+    format: u64,
+    packed: &[u8],
+    expected: &[u8],
+    zlib: bool,
+    label: &str,
+) {
+    let queue = s.queue(32);
+    let mut output = vec![INIT; GUARD + expected.len() + GUARD];
+    let compressed;
+    let (flags, source) = if zlib {
+        compressed = miniz_oxide::deflate::compress_to_vec_zlib(packed, 6);
+        (ZLIB, compressed.as_slice())
+    } else {
+        (0, packed)
+    };
+    let mut request = Request::memory(
+        (format << 1) | flags,
+        source,
+        &mut output[GUARD..GUARD + expected.len()],
+    );
+    if zlib {
+        request.intermediate_size = packed.len() as u32;
+    }
+    enqueue(queue, &request);
+    enqueue_status(queue, array, 0);
+    submit(queue);
+    let hr = wait(array, 0, 5000);
+    close(queue);
+    queue.release();
+    let interior = &output[GUARD..GUARD + expected.len()];
+    let guards = output[..GUARD]
+        .iter()
+        .chain(&output[GUARD + expected.len()..])
+        .all(|&b| b == INIT);
+    t.check(hr == S_OK && interior == expected && guards, label,
+        || format!("HRESULT {hr:#010x}, guards intact {guards}, destination {interior:02x?}, expected {expected:02x?}"));
+}
+
+fn format_pairs(t: &mut Tap, s: &Storage, array: Com) {
+    for &(format, packed, expected) in texture_pairs::PAIRS {
+        for (stage, zlib) in [("raw", false), ("zlib", true)] {
+            let label = format!("dstorage bcpack audit: format {format} {stage} two-block request");
+            deliver(t, s, array, format, packed, expected, zlib, &label);
+        }
+    }
+    // BC1 red endpoint deltas -16 then +15. Every quadrant uses selector 2.
+    deliver(
+        t,
+        s,
+        array,
+        1,
+        texture_pairs::CARRY,
+        &[
+            0, 128, 0, 0, 170, 170, 170, 170, 0, 120, 0, 0, 170, 170, 170, 170,
+        ],
+        false,
+        "dstorage bcpack audit: two-block split refill",
+    );
+}
+
 pub(super) fn run(t: &mut Tap, s: &Storage, array: Com) {
+    format_pairs(t, s, array);
     let raw = bc1_wire(true);
     let starvation = bc1_wire(false);
     let wrapped = miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6);

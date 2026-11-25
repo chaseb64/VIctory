@@ -20,7 +20,15 @@ $auditLabels = @(
     'dstorage bcpack audit: repeated BCPack on the same queue and status entry',
     'dstorage bcpack audit: single-block entropy lane completion'
 )
+$carryLabel = 'dstorage bcpack audit: two-block split refill'
+$auditLabels += $carryLabel
+foreach ($format in @(1,3,4,5,6,7)) {
+    foreach ($stage in @('raw','zlib')) {
+        $auditLabels += "dstorage bcpack audit: format $format $stage two-block request"
+    }
+}
 $expectedBaselineFailures = @(
+    $carryLabel,
     'dstorage bcpack audit: single-block entropy lane completion',
     'xasync: an async call with no queue and no process queue is E_NO_TASK_QUEUE',
     'xsystem: a retail console id is the documented zero id',
@@ -80,6 +88,7 @@ function Invoke-PairedRun([string] $Name, [string] $Source, [string] $WorkDir) {
     [IO.File]::WriteAllText($file, $extended)
     Copy-Item (Join-Path $PSScriptRoot 'dstorage_bcpack.rs') (Split-Path $file)
 
+    Copy-Item (Join-Path $PSScriptRoot 'texture_pairs.rs') (Split-Path $file)
     Push-Location $root
     try {
         $env:CARGO_TARGET_DIR = $target
@@ -134,12 +143,14 @@ function Invoke-PairedRun([string] $Name, [string] $Source, [string] $WorkDir) {
         if ($failureRows.Count -ne $expectedBaselineFailures.Count -or ($actual -join "`n") -cne ($expected -join "`n")) {
             throw "Baseline red markers differ. Expected [$($expected -join '; ')]; got [$($actual -join '; ')]. Log: $logPath"
         }
-        $starvationLabel = [regex]::Escape('dstorage bcpack audit: single-block entropy lane completion')
-        if ($report -notmatch "(?m)^not ok \d+ - $starvationLabel\n\s+# HRESULT 0x8007000d\b") {
-            throw "Baseline starvation failure did not report expected HRESULT 0x8007000d. Log: $logPath"
+        foreach ($label in @('dstorage bcpack audit: single-block entropy lane completion', $carryLabel)) {
+            $escaped = [regex]::Escape($label)
+            if ($report -notmatch "(?m)^not ok \d+ - $escaped\n\s+# HRESULT 0x8007000d\b") {
+                throw "Baseline did not report expected HRESULT 0x8007000d for $label. Log: $logPath"
+            }
         }
         if ($cargoExit -ne 101) { throw "Expected the baseline Cargo assertion failure (101), got $cargoExit. Log: $logPath" }
-        Write-Host 'Baseline red set matches the five known divergences plus the expected starvation failure.'
+        Write-Host 'Baseline red set matches the five known divergences plus both expected BCPack failures.'
     }
     else {
         $expected = @($knownFailures | Sort-Object -Unique)
@@ -147,7 +158,7 @@ function Invoke-PairedRun([string] $Name, [string] $Source, [string] $WorkDir) {
             throw "Candidate failures differ from the five pinned known divergences. Got [$($allFailures -join '; ')]. Log: $logPath"
         }
         if ($cargoExit -ne 0) { throw "Candidate cargo test failed despite green TAP markers. Log: $logPath" }
-        Write-Host 'Candidate: all 11 distinct audit markers passed.'
+        Write-Host "Candidate: all $($auditLabels.Count) distinct audit markers passed."
     }
 }
 

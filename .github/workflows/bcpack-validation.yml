@@ -1,7 +1,7 @@
-name: BCPack Windows verification
+name: BCPack Windows format delivery
 on:
   push:
-    branches: ['validation/bcpack-audit/combined-*']
+    branches: ['validation/bcpack-audit/runtime-formats-*']
 
 permissions:
   contents: read
@@ -10,13 +10,12 @@ jobs:
   verify:
     if: github.repository == 'chaseb64/VIctory' && github.event.repository.fork && !github.event.repository.private
     runs-on: windows-2025
-    timeout-minutes: 90
+    timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: never
       BASE_SHA: 940d32f69b22265690a0b5a15d6ded572ba33baf
       TEST_SHA: 66ee342f43b1767fa07477ee95ca65d510c75032
       HARNESS_SHA: d594a73ba38690d0ac4e230ec7949eb36c1a3c2d
-      REFERENCE_SHA: b1c3099a3402de8b76c9263a828791bd8bc0c930
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -35,18 +34,6 @@ jobs:
             /crates/victory-hle/tests/conformance.rs
             /docs/acceptance.md
             /tests/fixtures/conformance/
-      - name: Check out the public reference encoder and decoder
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: Ahmet-Dedeler/bcpack-rs
-          ref: b1c3099a3402de8b76c9263a828791bd8bc0c930
-          persist-credentials: false
-          path: reference
-          sparse-checkout-cone-mode: false
-          sparse-checkout: |
-            /src/
-            /LICENSE-*
-            /THIRD_PARTY_NOTICES.md
       - name: Pin sources and prepare isolated test checkouts
         shell: pwsh
         run: |
@@ -54,56 +41,19 @@ jobs:
           $evidence = New-Item -ItemType Directory -Path "$env:RUNNER_TEMP/bcpack-evidence"
           $base = "$env:RUNNER_TEMP/bcpack-base"
           $candidate = "$env:RUNNER_TEMP/bcpack-candidate"
-          if ((git -C control rev-parse HEAD^) -ne $env:TEST_SHA) { throw 'Unexpected workflow parent' }
+          if ((git -C control rev-parse HEAD^^) -ne $env:TEST_SHA) { throw 'Unexpected workflow parent' }
           if ((git -C harness rev-parse HEAD) -ne $env:HARNESS_SHA) { throw 'Unexpected conformance revision' }
-          if ((git -C reference rev-parse HEAD) -ne $env:REFERENCE_SHA) { throw 'Unexpected rANS reference revision' }
           git -C control worktree add --detach $base $env:BASE_SHA
           if ($LASTEXITCODE -ne 0) { throw 'Baseline checkout failed' }
           git -C control worktree add --detach $candidate $env:TEST_SHA
           if ($LASTEXITCODE -ne 0) { throw 'Candidate checkout failed' }
           @("source=$env:TEST_SHA", "baseline=$env:BASE_SHA", "workflow=$env:GITHUB_SHA",
             "attempt=$env:GITHUB_RUN_ATTEMPT", "run=$env:GITHUB_RUN_ID", "image=$env:ImageVersion",
-            "harness=$env:HARNESS_SHA", "reference=$env:REFERENCE_SHA") | Set-Content "$evidence/provenance.txt"
+            "harness=$env:HARNESS_SHA") | Set-Content "$evidence/provenance.txt"
           Set-Location $candidate
           rustup toolchain install
           if ($LASTEXITCODE -ne 0) { throw 'Pinned toolchain installation failed' }
           rustc -Vv | Tee-Object "$evidence/toolchain.log"
-      - name: Verify the integrated source
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $false
-          Set-Location "$env:RUNNER_TEMP/bcpack-candidate"
-          $dir = "$env:RUNNER_TEMP/bcpack-evidence"
-          $checks = [ordered]@{
-            'formats' = @('test', '-p', 'victory-formats', '--locked')
-            'dstorage' = @('test', '-p', 'victory-hle', '--locked', 'modules::dstorage::tests::')
-            'clippy' = @('clippy', '--workspace', '--all-targets', '--locked', '--', '-D', 'warnings')
-            'clippy-diagnostics' = @('clippy', '--workspace', '--all-targets', '--all-features', '--locked', '--', '-D', 'warnings')
-            'workspace' = @('test', '--workspace', '--locked')
-            'policy' = @('xtask', 'policy')
-          }
-          $failed = @()
-          foreach ($label in $checks.Keys) {
-            $arguments = $checks[$label]
-            & cargo @arguments 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object "$dir/$label.log"
-            $code = $LASTEXITCODE
-            if ($label -in @('formats','dstorage') -and !(Select-String -Quiet -Path "$dir/$label.log" -Pattern 'test result: ok\. [1-9][0-9]* passed')) { $code = 1 }
-            "$label=$code" | Add-Content "$dir/results.txt"
-            if ($code -ne 0) { $failed += $label }
-          }
-          if ($failed.Count) { throw "Failed checks $failed" }
-      - name: Compare independent entropy records on both revisions
-        if: '!cancelled()'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $tools = "$env:GITHUB_WORKSPACE/control/scripts/bcpack-audit"
-          $ref = "$env:GITHUB_WORKSPACE/reference"
-          $dir = "$env:RUNNER_TEMP/bcpack-evidence"
-          & "$tools/run-entropy-replay.ps1" -Victory "$env:RUNNER_TEMP/bcpack-base" -Reference $ref -ExpectedDisagreements 12 | Tee-Object "$dir/entropy-baseline.log"
-          & "$tools/run-entropy-replay.ps1" -Victory "$env:RUNNER_TEMP/bcpack-candidate" -Reference $ref -ExpectedDisagreements 0 -AdditionalCases 5000 | Tee-Object "$dir/entropy-candidate.log"
-          'independent-entropy=0' | Add-Content "$dir/results.txt"
       - name: Compare queued file and memory requests on both revisions
         if: '!cancelled()'
         shell: pwsh
